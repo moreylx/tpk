@@ -1,0 +1,25 @@
+[package]
+name = "nt_wrapper"
+version = "0.1.0"
+edition = "2021"
+authors = ["moreylx"]
+description = "Native Windows API wrapper in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/moreylx/nt-wrapper-rs"
+keywords = ["windows", "nt", "api", "native"]
+categories = ["os::windows-apis"]
+
+[dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security"
+]}
+
+[lib]
+name = "nt_wrapper"
+path = "src/lib.rs"
