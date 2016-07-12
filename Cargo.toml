@@ -1,0 +1,109 @@
+[package]
+name = "nt_mapper_rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["NT Mapper Team"]
+description = "System utilities and process management toolkit for Windows NT systems"
+license = "MIT"
+repository = "https://github.com/nt-mapper/nt_mapper_rust"
+keywords = ["windows", "process", "system", "nt", "kernel"]
+categories = ["os::windows-apis", "development-tools::profiling"]
+readme = "README.md"
+
+[lib]
+name = "nt_mapper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nt_mapper_cli"
+path = "src/bin/cli.rs"
+
+[features]
+default = ["std"]
+std = []
+kernel_mode = []
+debug_symbols = []
+elevated_privileges = []
+
+[dependencies]
+thiserror = "1.0"
+log = "0.4"
+bitflags = "2.4"
+parking_lot = "0.12"
+once_cell = "1.19"
+memoffset = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
+    "Win32_System_Kernel",
+]}
+ntapi = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+tempfile = "3.9"
+tracing-test = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.69"
+
+[[bench]]
+name = "process_enumeration"
+harness = false
+
+[[bench]]
+name = "memory_operations"
+harness = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+unused_results = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
