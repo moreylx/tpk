@@ -9,11 +9,11 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod error;
-pub mod process;
-pub mod system;
 pub mod memory;
 pub mod observer;
+pub mod process;
 pub mod strategy;
+pub mod system;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,21 +35,24 @@ pub type Result<T> = std::result::Result<T, error::MapperError>;
 ///
 /// Returns an error if initialization fails or if already initialized
 pub fn initialize() -> Result<()> {
-    if INITIALIZED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err(error::MapperError::AlreadyInitialized);
     }
-    
+
     // Platform-specific initialization
     #[cfg(target_os = "windows")]
     {
         system::windows::init_subsystem()?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         system::linux::init_subsystem()?;
     }
-    
+
     Ok(())
 }
 
@@ -61,12 +64,15 @@ pub fn is_initialized() -> bool {
 
 /// Shutdown and cleanup library resources
 pub fn shutdown() {
-    if INITIALIZED.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    if INITIALIZED
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         #[cfg(target_os = "windows")]
         {
             system::windows::cleanup_subsystem();
         }
-        
+
         #[cfg(target_os = "linux")]
         {
             system::linux::cleanup_subsystem();
@@ -77,400 +83,275 @@ pub fn shutdown() {
 /// Error types for the library
 pub mod error {
     use std::fmt;
-    
-    /// Main error type for library operations
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum MapperError {
-        /// Library already initialized
-        AlreadyInitialized,
-        /// Library not initialized
-        NotInitialized,
-        /// Process not found
-        ProcessNotFound(u32),
-        /// Permission denied for operation
-        PermissionDenied(String),
-        /// Memory operation failed
-        MemoryError(String),
-        /// System call failed
-        SystemError(i32, String),
-        /// Invalid argument provided
-        InvalidArgument(String),
-        /// Resource temporarily unavailable
-        ResourceBusy,
-        /// Operation timed out
-        Timeout,
-        /// Generic I/O error
-        IoError(String),
+    use std::io;
+
+    /// NT Status code representation for Windows API compatibility
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
+    pub struct NtStatus(i32);
+
+    impl NtStatus {
+        /// Success status
+        pub const SUCCESS: Self = Self(0);
+        /// Access denied status
+        pub const ACCESS_DENIED: Self = Self(-1_073_741_790); // 0xC0000022
+        /// Invalid handle status
+        pub const INVALID_HANDLE: Self = Self(-1_073_741_816); // 0xC0000008
+        /// Invalid parameter status
+        pub const INVALID_PARAMETER: Self = Self(-1_073_741_811); // 0xC000000D
+        /// Not found status
+        pub const NOT_FOUND: Self = Self(-1_073_741_772); // 0xC0000034
+        /// Buffer too small status
+        pub const BUFFER_TOO_SMALL: Self = Self(-1_073_741_789); // 0xC0000023
+        /// Insufficient resources status
+        pub const INSUFFICIENT_RESOURCES: Self = Self(-1_073_741_670); // 0xC000009A
+
+        /// Create a new `NtStatus` from a raw value
+        #[must_use]
+        pub const fn from_raw(value: i32) -> Self {
+            Self(value)
+        }
+
+        /// Get the raw status value
+        #[must_use]
+        pub const fn raw(self) -> i32 {
+            self.0
+        }
+
+        /// Check if the status indicates success
+        #[must_use]
+        pub const fn is_success(self) -> bool {
+            self.0 >= 0
+        }
+
+        /// Check if the status indicates an error
+        #[must_use]
+        pub const fn is_error(self) -> bool {
+            self.0 < 0
+        }
+
+        /// Convert to a human-readable description
+        #[must_use]
+        pub fn description(self) -> &'static str {
+            match self {
+                Self::SUCCESS => "Operation completed successfully",
+                Self::ACCESS_DENIED => "Access denied",
+                Self::INVALID_HANDLE => "Invalid handle",
+                Self::INVALID_PARAMETER => "Invalid parameter",
+                Self::NOT_FOUND => "Object not found",
+                Self::BUFFER_TOO_SMALL => "Buffer too small",
+                Self::INSUFFICIENT_RESOURCES => "Insufficient resources",
+                _ => "Unknown status code",
+            }
+        }
     }
-    
+
+    impl fmt::Display for NtStatus {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "0x{:08X}: {}", self.0 as u32, self.description())
+        }
+    }
+
+    impl From<i32> for NtStatus {
+        fn from(value: i32) -> Self {
+            Self::from_raw(value)
+        }
+    }
+
+    impl From<NtStatus> for i32 {
+        fn from(status: NtStatus) -> Self {
+            status.raw()
+        }
+    }
+
+    /// Primary error type for all library operations
+    #[derive(Debug)]
+    pub enum MapperError {
+        /// Library has already been initialized
+        AlreadyInitialized,
+        /// Library has not been initialized
+        NotInitialized,
+        /// NT status code error from system calls
+        NtStatusError(NtStatus),
+        /// Standard I/O error
+        IoError(io::Error),
+        /// Process not found by ID or name
+        ProcessNotFound {
+            /// Identifier used in the search
+            identifier: String,
+        },
+        /// Invalid process handle
+        InvalidHandle,
+        /// Permission denied for the requested operation
+        PermissionDenied {
+            /// Description of the denied operation
+            operation: String,
+        },
+        /// Memory operation failed
+        MemoryError {
+            /// Address where the error occurred
+            address: usize,
+            /// Description of the memory operation
+            operation: String,
+        },
+        /// Resource allocation failure
+        ResourceExhausted {
+            /// Type of resource that was exhausted
+            resource: String,
+        },
+        /// Invalid argument provided
+        InvalidArgument {
+            /// Name of the invalid argument
+            name: String,
+            /// Reason why it's invalid
+            reason: String,
+        },
+        /// Operation timed out
+        Timeout {
+            /// Duration in milliseconds
+            duration_ms: u64,
+        },
+        /// Platform-specific error
+        PlatformError {
+            /// Platform identifier
+            platform: String,
+            /// Error code
+            code: i32,
+            /// Error message
+            message: String,
+        },
+        /// Generic internal error
+        Internal(String),
+    }
+
+    impl MapperError {
+        /// Create a new NT status error
+        #[must_use]
+        pub const fn from_nt_status(status: NtStatus) -> Self {
+            Self::NtStatusError(status)
+        }
+
+        /// Create a process not found error
+        #[must_use]
+        pub fn process_not_found(identifier: impl Into<String>) -> Self {
+            Self::ProcessNotFound {
+                identifier: identifier.into(),
+            }
+        }
+
+        /// Create a permission denied error
+        #[must_use]
+        pub fn permission_denied(operation: impl Into<String>) -> Self {
+            Self::PermissionDenied {
+                operation: operation.into(),
+            }
+        }
+
+        /// Create a memory error
+        #[must_use]
+        pub fn memory_error(address: usize, operation: impl Into<String>) -> Self {
+            Self::MemoryError {
+                address,
+                operation: operation.into(),
+            }
+        }
+
+        /// Create an invalid argument error
+        #[must_use]
+        pub fn invalid_argument(name: impl Into<String>, reason: impl Into<String>) -> Self {
+            Self::InvalidArgument {
+                name: name.into(),
+                reason: reason.into(),
+            }
+        }
+
+        /// Check if this error is recoverable
+        #[must_use]
+        pub const fn is_recoverable(&self) -> bool {
+            matches!(
+                self,
+                Self::Timeout { .. } | Self::ResourceExhausted { .. }
+            )
+        }
+    }
+
     impl fmt::Display for MapperError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::AlreadyInitialized => write!(f, "Library already initialized"),
                 Self::NotInitialized => write!(f, "Library not initialized"),
-                Self::ProcessNotFound(pid) => write!(f, "Process not found: {pid}"),
-                Self::PermissionDenied(op) => write!(f, "Permission denied: {op}"),
-                Self::MemoryError(msg) => write!(f, "Memory error: {msg}"),
-                Self::SystemError(code, msg) => write!(f, "System error ({code}): {msg}"),
-                Self::InvalidArgument(arg) => write!(f, "Invalid argument: {arg}"),
-                Self::ResourceBusy => write!(f, "Resource temporarily unavailable"),
-                Self::Timeout => write!(f, "Operation timed out"),
-                Self::IoError(msg) => write!(f, "I/O error: {msg}"),
-            }
-        }
-    }
-    
-    impl std::error::Error for MapperError {}
-    
-    impl From<std::io::Error> for MapperError {
-        fn from(err: std::io::Error) -> Self {
-            Self::IoError(err.to_string())
-        }
-    }
-}
-
-/// Process management module
-pub mod process {
-    use super::Result;
-    
-    /// Process identifier type
-    pub type Pid = u32;
-    
-    /// Process information structure
-    #[derive(Debug, Clone)]
-    pub struct ProcessInfo {
-        /// Process ID
-        pub pid: Pid,
-        /// Parent process ID
-        pub parent_pid: Option<Pid>,
-        /// Process name
-        pub name: String,
-        /// Executable path
-        pub exe_path: Option<std::path::PathBuf>,
-        /// Process state
-        pub state: ProcessState,
-        /// Memory usage in bytes
-        pub memory_usage: u64,
-        /// CPU usage percentage
-        pub cpu_usage: f32,
-    }
-    
-    /// Process execution state
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ProcessState {
-        /// Process is running
-        Running,
-        /// Process is sleeping
-        Sleeping,
-        /// Process is stopped
-        Stopped,
-        /// Process is a zombie
-        Zombie,
-        /// Unknown state
-        Unknown,
-    }
-    
-    /// Process handle with RAII cleanup
-    pub struct ProcessHandle {
-        pid: Pid,
-        #[cfg(target_os = "windows")]
-        handle: Option<*mut std::ffi::c_void>,
-        #[cfg(target_os = "linux")]
-        _marker: std::marker::PhantomData<()>,
-    }
-    
-    impl ProcessHandle {
-        /// Open a process by PID
-        ///
-        /// # Errors
-        ///
-        /// Returns error if process cannot be opened
-        pub fn open(_pid: Pid) -> Result<Self> {
-            todo!("Platform-specific implementation")
-        }
-        
-        /// Get the process ID
-        #[must_use]
-        pub fn pid(&self) -> Pid {
-            self.pid
-        }
-    }
-    
-    impl Drop for ProcessHandle {
-        fn drop(&mut self) {
-            #[cfg(target_os = "windows")]
-            {
-                // Close handle on Windows
-            }
-        }
-    }
-    
-    /// List all running processes
-    ///
-    /// # Errors
-    ///
-    /// Returns error if process enumeration fails
-    pub fn enumerate_processes() -> Result<Vec<ProcessInfo>> {
-        todo!("Platform-specific implementation")
-    }
-    
-    /// Get information about a specific process
-    ///
-    /// # Errors
-    ///
-    /// Returns error if process not found or access denied
-    pub fn get_process_info(_pid: Pid) -> Result<ProcessInfo> {
-        todo!("Platform-specific implementation")
-    }
-}
-
-/// System information module
-pub mod system {
-    use super::Result;
-    
-    /// System information structure
-    #[derive(Debug, Clone)]
-    pub struct SystemInfo {
-        /// Operating system name
-        pub os_name: String,
-        /// OS version
-        pub os_version: String,
-        /// Kernel version
-        pub kernel_version: String,
-        /// Hostname
-        pub hostname: String,
-        /// Number of CPU cores
-        pub cpu_count: usize,
-        /// Total physical memory in bytes
-        pub total_memory: u64,
-        /// System architecture
-        pub architecture: Architecture,
-    }
-    
-    /// System architecture
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Architecture {
-        /// x86 32-bit
-        X86,
-        /// x86 64-bit
-        X86_64,
-        /// ARM 32-bit
-        Arm,
-        /// ARM 64-bit
-        Arm64,
-        /// Unknown architecture
-        Unknown,
-    }
-    
-    /// Get system information
-    ///
-    /// # Errors
-    ///
-    /// Returns error if system info cannot be retrieved
-    pub fn get_system_info() -> Result<SystemInfo> {
-        todo!("Platform-specific implementation")
-    }
-    
-    /// Windows-specific subsystem
-    #[cfg(target_os = "windows")]
-    pub mod windows {
-        use crate::Result;
-        
-        pub(crate) fn init_subsystem() -> Result<()> {
-            Ok(())
-        }
-        
-        pub(crate) fn cleanup_subsystem() {
-            // Cleanup Windows resources
-        }
-    }
-    
-    /// Linux-specific subsystem
-    #[cfg(target_os = "linux")]
-    pub mod linux {
-        use crate::Result;
-        
-        pub(crate) fn init_subsystem() -> Result<()> {
-            Ok(())
-        }
-        
-        pub(crate) fn cleanup_subsystem() {
-            // Cleanup Linux resources
-        }
-    }
-}
-
-/// Memory management module
-pub mod memory {
-    use super::Result;
-    
-    /// Memory region information
-    #[derive(Debug, Clone)]
-    pub struct MemoryRegion {
-        /// Base address
-        pub base_address: usize,
-        /// Region size in bytes
-        pub size: usize,
-        /// Protection flags
-        pub protection: MemoryProtection,
-        /// Region state
-        pub state: MemoryState,
-        /// Region type
-        pub region_type: MemoryType,
-    }
-    
-    /// Memory protection flags
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct MemoryProtection {
-        /// Readable
-        pub read: bool,
-        /// Writable
-        pub write: bool,
-        /// Executable
-        pub execute: bool,
-    }
-    
-    impl MemoryProtection {
-        /// No access
-        pub const NONE: Self = Self { read: false, write: false, execute: false };
-        /// Read-only
-        pub const READ: Self = Self { read: true, write: false, execute: false };
-        /// Read-write
-        pub const READ_WRITE: Self = Self { read: true, write: true, execute: false };
-        /// Read-execute
-        pub const READ_EXECUTE: Self = Self { read: true, write: false, execute: true };
-    }
-    
-    /// Memory region state
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MemoryState {
-        /// Memory is committed
-        Committed,
-        /// Memory is reserved
-        Reserved,
-        /// Memory is free
-        Free,
-    }
-    
-    /// Memory region type
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MemoryType {
-        /// Private memory
-        Private,
-        /// Mapped file
-        Mapped,
-        /// Image (executable)
-        Image,
-    }
-    
-    /// Query memory regions for a process
-    ///
-    /// # Errors
-    ///
-    /// Returns error if memory query fails
-    pub fn query_memory_regions(_pid: super::process::Pid) -> Result<Vec<MemoryRegion>> {
-        todo!("Platform-specific implementation")
-    }
-}
-
-/// Observer pattern implementation
-pub mod observer {
-    use std::sync::{Arc, Weak, Mutex};
-    
-    /// Event type for observer notifications
-    pub trait Event: Send + Sync + Clone + 'static {}
-    
-    /// Observer trait for receiving events
-    pub trait Observer<E: Event>: Send + Sync {
-        /// Called when an event occurs
-        fn on_event(&self, event: &E);
-    }
-    
-    /// Subject that can be observed
-    pub struct Subject<E: Event> {
-        observers: Mutex<Vec<Weak<dyn Observer<E>>>>,
-    }
-    
-    impl<E: Event> Subject<E> {
-        /// Create a new subject
-        #[must_use]
-        pub fn new() -> Self {
-            Self {
-                observers: Mutex::new(Vec::new()),
-            }
-        }
-        
-        /// Subscribe an observer
-        pub fn subscribe(&self, observer: Arc<dyn Observer<E>>) {
-            let mut observers = self.observers.lock().unwrap();
-            observers.push(Arc::downgrade(&observer));
-        }
-        
-        /// Notify all observers of an event
-        pub fn notify(&self, event: &E) {
-            let observers = self.observers.lock().unwrap();
-            for weak_observer in observers.iter() {
-                if let Some(observer) = weak_observer.upgrade() {
-                    observer.on_event(event);
+                Self::NtStatusError(status) => write!(f, "NT status error: {status}"),
+                Self::IoError(err) => write!(f, "I/O error: {err}"),
+                Self::ProcessNotFound { identifier } => {
+                    write!(f, "Process not found: {identifier}")
                 }
+                Self::InvalidHandle => write!(f, "Invalid handle"),
+                Self::PermissionDenied { operation } => {
+                    write!(f, "Permission denied for operation: {operation}")
+                }
+                Self::MemoryError { address, operation } => {
+                    write!(f, "Memory error at 0x{address:X} during {operation}")
+                }
+                Self::ResourceExhausted { resource } => {
+                    write!(f, "Resource exhausted: {resource}")
+                }
+                Self::InvalidArgument { name, reason } => {
+                    write!(f, "Invalid argument '{name}': {reason}")
+                }
+                Self::Timeout { duration_ms } => {
+                    write!(f, "Operation timed out after {duration_ms}ms")
+                }
+                Self::PlatformError {
+                    platform,
+                    code,
+                    message,
+                } => {
+                    write!(f, "Platform error [{platform}] (code {code}): {message}")
+                }
+                Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             }
         }
-        
-        /// Remove expired observer references
-        pub fn cleanup(&self) {
-            let mut observers = self.observers.lock().unwrap();
-            observers.retain(|weak| weak.strong_count() > 0);
-        }
     }
-    
-    impl<E: Event> Default for Subject<E> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-}
 
-/// Strategy pattern implementation
-pub mod strategy {
-    use super::Result;
-    
-    /// Strategy trait for process enumeration
-    pub trait EnumerationStrategy: Send + Sync {
-        /// Enumerate processes using this strategy
-        fn enumerate(&self) -> Result<Vec<super::process::ProcessInfo>>;
-        
-        /// Strategy name for identification
-        fn name(&self) -> &'static str;
-    }
-    
-    /// Strategy trait for memory scanning
-    pub trait ScanStrategy: Send + Sync {
-        /// Scan memory using this strategy
-        fn scan(&self, pid: super::process::Pid, pattern: &[u8]) -> Result<Vec<usize>>;
-        
-        /// Strategy name for identification
-        fn name(&self) -> &'static str;
-    }
-    
-    /// Strategy context for runtime strategy selection
-    pub struct StrategyContext<S: ?Sized> {
-        strategy: Box<S>,
-    }
-    
-    impl<S: ?Sized> StrategyContext<S> {
-        /// Create a new context with the given strategy
-        pub fn new(strategy: Box<S>) -> Self {
-            Self { strategy }
+    impl std::error::Error for MapperError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::IoError(err) => Some(err),
+                _ => None,
+            }
         }
-        
-        /// Replace the current strategy
-        pub fn set_strategy(&mut self, strategy: Box<S>) {
-            self.strategy = strategy;
+    }
+
+    impl From<io::Error> for MapperError {
+        fn from(err: io::Error) -> Self {
+            Self::IoError(err)
         }
-        
-        /// Get a reference to the current strategy
-        pub fn strategy(&self) -> &S {
-            &*self.strategy
+    }
+
+    impl From<NtStatus> for MapperError {
+        fn from(status: NtStatus) -> Self {
+            Self::NtStatusError(status)
+        }
+    }
+
+    /// Extension trait for converting `Result<T, MapperError>` to NT status
+    pub trait ResultExt<T> {
+        /// Convert to NT status, returning `NtStatus::SUCCESS` on `Ok`
+        fn to_nt_status(&self) -> NtStatus;
+    }
+
+    impl<T> ResultExt<T> for std::result::Result<T, MapperError> {
+        fn to_nt_status(&self) -> NtStatus {
+            match self {
+                Ok(_) => NtStatus::SUCCESS,
+                Err(MapperError::NtStatusError(status)) => *status,
+                Err(MapperError::PermissionDenied { .. }) => NtStatus::ACCESS_DENIED,
+                Err(MapperError::InvalidHandle) => NtStatus::INVALID_HANDLE,
+                Err(MapperError::InvalidArgument { .. }) => NtStatus::INVALID_PARAMETER,
+                Err(MapperError::ProcessNotFound { .. }) => NtStatus::NOT_FOUND,
+                Err(MapperError::ResourceExhausted { .. }) => NtStatus::INSUFFICIENT_RESOURCES,
+                Err(_) => NtStatus::from_raw(-1),
+            }
         }
     }
 }
@@ -478,22 +359,43 @@ pub mod strategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_version_defined() {
-        assert!(!VERSION.is_empty());
+    fn test_nt_status_success() {
+        let status = error::NtStatus::SUCCESS;
+        assert!(status.is_success());
+        assert!(!status.is_error());
+        assert_eq!(status.raw(), 0);
     }
-    
+
     #[test]
-    fn test_name_defined() {
-        assert_eq!(NAME, "nt_mapper_rust");
+    fn test_nt_status_error() {
+        let status = error::NtStatus::ACCESS_DENIED;
+        assert!(!status.is_success());
+        assert!(status.is_error());
     }
-    
+
     #[test]
-    fn test_memory_protection_constants() {
-        assert!(!memory::MemoryProtection::NONE.read);
-        assert!(memory::MemoryProtection::READ.read);
-        assert!(memory::MemoryProtection::READ_WRITE.write);
-        assert!(memory::MemoryProtection::READ_EXECUTE.execute);
+    fn test_mapper_error_display() {
+        let err = error::MapperError::process_not_found("test_process");
+        assert!(err.to_string().contains("test_process"));
+    }
+
+    #[test]
+    fn test_error_conversion() {
+        let status = error::NtStatus::INVALID_HANDLE;
+        let err: error::MapperError = status.into();
+        assert!(matches!(err, error::MapperError::NtStatusError(_)));
+    }
+
+    #[test]
+    fn test_result_ext() {
+        use error::ResultExt;
+
+        let ok_result: Result<i32> = Ok(42);
+        assert_eq!(ok_result.to_nt_status(), error::NtStatus::SUCCESS);
+
+        let err_result: Result<i32> = Err(error::MapperError::InvalidHandle);
+        assert_eq!(err_result.to_nt_status(), error::NtStatus::INVALID_HANDLE);
     }
 }
