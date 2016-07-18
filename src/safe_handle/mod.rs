@@ -7,8 +7,13 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{MapperError, NtStatus};
+
+/// Global handle statistics for debugging and monitoring
+static HANDLES_CREATED: AtomicU64 = AtomicU64::new(0);
+static HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
 
 /// Trait defining handle cleanup behavior
 pub trait HandleDrop {
@@ -53,6 +58,8 @@ impl<T: HandleDrop> SafeHandle<T> {
         // SAFETY: We just verified the handle is not null
         let inner = unsafe { NonNull::new_unchecked(handle) };
         
+        HANDLES_CREATED.fetch_add(1, Ordering::Relaxed);
+        
         Ok(Self {
             inner,
             _marker: PhantomData,
@@ -65,7 +72,10 @@ impl<T: HandleDrop> SafeHandle<T> {
         self.inner.as_ptr()
     }
     
-    /// Consumes the handle and returns the raw value without cleanup
+    /// Consumes the handle and returns the raw value without closing it
+    /// 
+    /// # Safety
+    /// The caller becomes responsible for closing the handle
     #[inline]
     pub fn into_raw(self) -> *mut std::ffi::c_void {
         let ptr = self.inner.as_ptr();
@@ -73,19 +83,68 @@ impl<T: HandleDrop> SafeHandle<T> {
         ptr
     }
     
-    /// Attempts to duplicate this handle
+    /// Duplicates the handle if the underlying type supports it
     pub fn try_clone(&self) -> Result<Self, MapperError> {
-        // Platform-specific duplication would go here
-        // For now, return an error indicating duplication is not supported
-        Err(MapperError::OperationNotSupported {
-            operation: "handle duplication",
-        })
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                DuplicateHandle, GetCurrentProcess, DUPLICATE_SAME_ACCESS,
+            };
+            
+            let mut new_handle: *mut std::ffi::c_void = std::ptr::null_mut();
+            let current_process = unsafe { GetCurrentProcess() };
+            
+            let result = unsafe {
+                DuplicateHandle(
+                    current_process,
+                    self.inner.as_ptr(),
+                    current_process,
+                    &mut new_handle as *mut _ as *mut _,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            
+            if result == 0 {
+                return Err(MapperError::HandleDuplicationFailed {
+                    handle_type: T::type_name(),
+                });
+            }
+            
+            Self::new(new_handle)
+        }
+        
+        #[cfg(not(windows))]
+        {
+            Err(MapperError::UnsupportedPlatform)
+        }
+    }
+    
+    /// Checks if the handle is still valid
+    pub fn is_valid(&self) -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::GetHandleInformation;
+            
+            let mut flags: u32 = 0;
+            let result = unsafe {
+                GetHandleInformation(self.inner.as_ptr(), &mut flags)
+            };
+            result != 0
+        }
+        
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 }
 
 impl<T: HandleDrop> Drop for SafeHandle<T> {
     fn drop(&mut self) {
         T::drop_handle(self.inner.as_ptr());
+        HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -93,31 +152,33 @@ impl<T: HandleDrop> fmt::Debug for SafeHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SafeHandle")
             .field("type", &T::type_name())
-            .field("value", &format_args!("{:p}", self.inner.as_ptr()))
+            .field("ptr", &format_args!("{:p}", self.inner.as_ptr()))
             .finish()
     }
 }
 
-// SafeHandle is Send if the underlying handle can be safely transferred
-unsafe impl<T: HandleDrop + Send> Send for SafeHandle<T> {}
+impl<T: HandleDrop> Deref for SafeHandle<T> {
+    type Target = *mut std::ffi::c_void;
+    
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: We maintain a valid pointer throughout the lifetime
+        unsafe { &*(&self.inner as *const NonNull<_> as *const *mut _) }
+    }
+}
 
-// SafeHandle is Sync if the underlying handle can be safely shared
-unsafe impl<T: HandleDrop + Sync> Sync for SafeHandle<T> {}
+// SAFETY: Handles can be sent between threads
+unsafe impl<T: HandleDrop> Send for SafeHandle<T> {}
 
-/// Handle drop strategy for process handles
+/// Process handle drop strategy
 pub struct ProcessHandleDrop;
 
 impl HandleDrop for ProcessHandleDrop {
     fn drop_handle(handle: *mut std::ffi::c_void) {
         #[cfg(windows)]
-        unsafe {
-            // CloseHandle equivalent
-            extern "system" {
-                fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-            }
-            let _ = CloseHandle(handle);
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe { CloseHandle(handle) };
         }
-        
         #[cfg(not(windows))]
         {
             let _ = handle;
@@ -129,19 +190,16 @@ impl HandleDrop for ProcessHandleDrop {
     }
 }
 
-/// Handle drop strategy for file handles
+/// File handle drop strategy
 pub struct FileHandleDrop;
 
 impl HandleDrop for FileHandleDrop {
     fn drop_handle(handle: *mut std::ffi::c_void) {
         #[cfg(windows)]
-        unsafe {
-            extern "system" {
-                fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-            }
-            let _ = CloseHandle(handle);
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe { CloseHandle(handle) };
         }
-        
         #[cfg(not(windows))]
         {
             let _ = handle;
@@ -153,19 +211,16 @@ impl HandleDrop for FileHandleDrop {
     }
 }
 
-/// Handle drop strategy for memory section handles
-pub struct SectionHandleDrop;
+/// Memory mapping handle drop strategy
+pub struct MappingHandleDrop;
 
-impl HandleDrop for SectionHandleDrop {
+impl HandleDrop for MappingHandleDrop {
     fn drop_handle(handle: *mut std::ffi::c_void) {
         #[cfg(windows)]
-        unsafe {
-            extern "system" {
-                fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-            }
-            let _ = CloseHandle(handle);
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe { CloseHandle(handle) };
         }
-        
         #[cfg(not(windows))]
         {
             let _ = handle;
@@ -173,20 +228,65 @@ impl HandleDrop for SectionHandleDrop {
     }
     
     fn type_name() -> &'static str {
-        "Section"
+        "FileMapping"
     }
 }
 
-/// Type alias for process handles
+/// Thread handle drop strategy
+pub struct ThreadHandleDrop;
+
+impl HandleDrop for ThreadHandleDrop {
+    fn drop_handle(handle: *mut std::ffi::c_void) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe { CloseHandle(handle) };
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = handle;
+        }
+    }
+    
+    fn type_name() -> &'static str {
+        "Thread"
+    }
+}
+
+/// Type aliases for common handle types
 pub type ProcessHandle = SafeHandle<ProcessHandleDrop>;
-
-/// Type alias for file handles  
 pub type FileHandle = SafeHandle<FileHandleDrop>;
+pub type MappingHandle = SafeHandle<MappingHandleDrop>;
+pub type ThreadHandle = SafeHandle<ThreadHandleDrop>;
 
-/// Type alias for section handles
-pub type SectionHandle = SafeHandle<SectionHandleDrop>;
+/// Handle statistics for monitoring
+#[derive(Debug, Clone, Copy)]
+pub struct HandleStats {
+    pub created: u64,
+    pub closed: u64,
+    pub active: u64,
+}
 
-/// Mapped memory view with automatic unmapping
+impl HandleStats {
+    /// Retrieves current handle statistics
+    pub fn current() -> Self {
+        let created = HANDLES_CREATED.load(Ordering::Relaxed);
+        let closed = HANDLES_CLOSED.load(Ordering::Relaxed);
+        Self {
+            created,
+            closed,
+            active: created.saturating_sub(closed),
+        }
+    }
+    
+    /// Resets the statistics counters
+    pub fn reset() {
+        HANDLES_CREATED.store(0, Ordering::Relaxed);
+        HANDLES_CLOSED.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Mapped view wrapper for memory-mapped file regions
 pub struct MappedView {
     base: NonNull<u8>,
     size: usize,
@@ -198,115 +298,84 @@ impl MappedView {
     /// # Safety
     /// The caller must ensure the memory region is valid and properly mapped
     pub unsafe fn new(base: *mut u8, size: usize) -> Result<Self, MapperError> {
-        if base.is_null() {
-            return Err(MapperError::InvalidHandle {
-                handle_type: "MappedView",
-                reason: "null base address",
-            });
-        }
+        let base = NonNull::new(base).ok_or(MapperError::InvalidHandle {
+            handle_type: "MappedView",
+            reason: "null base address",
+        })?;
         
-        if size == 0 {
-            return Err(MapperError::InvalidParameter {
-                param: "size",
-                reason: "mapped view size cannot be zero",
-            });
-        }
-        
-        Ok(Self {
-            base: NonNull::new_unchecked(base),
-            size,
-        })
+        Ok(Self { base, size })
     }
     
-    /// Returns the base address of the mapped view
+    /// Returns the base address of the mapped region
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.base.as_ptr()
     }
     
-    /// Returns a mutable pointer to the base address
+    /// Returns a mutable pointer to the mapped region
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.base.as_ptr()
     }
     
-    /// Returns the size of the mapped view
+    /// Returns the size of the mapped region
     #[inline]
     pub fn size(&self) -> usize {
         self.size
     }
     
-    /// Returns the mapped memory as a byte slice
+    /// Returns the mapped region as a byte slice
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: The memory was validated during construction
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.size) }
     }
     
-    /// Returns the mapped memory as a mutable byte slice
+    /// Returns the mapped region as a mutable byte slice
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: The memory was validated during construction
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.size) }
     }
     
     /// Reads a value of type T at the specified offset
-    /// 
-    /// # Safety
-    /// The offset must be properly aligned and within bounds
-    pub unsafe fn read_at<V: Copy>(&self, offset: usize) -> Result<V, MapperError> {
-        let type_size = std::mem::size_of::<V>();
+    pub fn read_at<T: Copy>(&self, offset: usize) -> Result<T, MapperError> {
+        let type_size = std::mem::size_of::<T>();
         
         if offset.checked_add(type_size).map_or(true, |end| end > self.size) {
-            return Err(MapperError::OutOfBounds {
-                offset,
-                size: type_size,
-                limit: self.size,
+            return Err(MapperError::BufferOverflow {
+                requested: offset + type_size,
+                available: self.size,
             });
         }
         
-        let ptr = self.base.as_ptr().add(offset) as *const V;
+        let ptr = unsafe { self.base.as_ptr().add(offset) as *const T };
         
-        if (ptr as usize) % std::mem::align_of::<V>() != 0 {
-            return Err(MapperError::AlignmentError {
-                address: ptr as usize,
-                required: std::mem::align_of::<V>(),
-            });
+        if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+            // Unaligned read - use read_unaligned
+            Ok(unsafe { ptr.read_unaligned() })
+        } else {
+            Ok(unsafe { ptr.read() })
         }
-        
-        Ok(ptr.read_unaligned())
     }
     
-    /// Writes a value of type T at the specified offset
-    /// 
-    /// # Safety
-    /// The offset must be properly aligned and within bounds
-    pub unsafe fn write_at<V: Copy>(&mut self, offset: usize, value: V) -> Result<(), MapperError> {
-        let type_size = std::mem::size_of::<V>();
-        
-        if offset.checked_add(type_size).map_or(true, |end| end > self.size) {
-            return Err(MapperError::OutOfBounds {
-                offset,
-                size: type_size,
-                limit: self.size,
+    /// Reads a slice of bytes at the specified offset
+    pub fn read_bytes(&self, offset: usize, len: usize) -> Result<&[u8], MapperError> {
+        if offset.checked_add(len).map_or(true, |end| end > self.size) {
+            return Err(MapperError::BufferOverflow {
+                requested: offset + len,
+                available: self.size,
             });
         }
         
-        let ptr = self.base.as_ptr().add(offset) as *mut V;
-        ptr.write_unaligned(value);
-        
-        Ok(())
+        Ok(unsafe { std::slice::from_raw_parts(self.base.as_ptr().add(offset), len) })
     }
 }
 
 impl Drop for MappedView {
     fn drop(&mut self) {
         #[cfg(windows)]
-        unsafe {
-            extern "system" {
-                fn UnmapViewOfFile(base: *mut std::ffi::c_void) -> i32;
-            }
-            let _ = UnmapViewOfFile(self.base.as_ptr() as *mut std::ffi::c_void);
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            unsafe { UnmapViewOfFile(self.base.as_ptr() as _) };
         }
     }
 }
@@ -315,15 +384,18 @@ impl fmt::Debug for MappedView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MappedView")
             .field("base", &format_args!("{:p}", self.base.as_ptr()))
-            .field("size", &format_args!("0x{:x}", self.size))
+            .field("size", &self.size)
             .finish()
     }
 }
 
+// SAFETY: MappedView can be sent between threads
+unsafe impl Send for MappedView {}
+
 /// Handle guard for temporary handle borrowing with automatic restoration
 pub struct HandleGuard<'a, T: HandleDrop> {
     handle: &'a SafeHandle<T>,
-    original_value: *mut std::ffi::c_void,
+    _phantom: PhantomData<&'a ()>,
 }
 
 impl<'a, T: HandleDrop> HandleGuard<'a, T> {
@@ -331,14 +403,14 @@ impl<'a, T: HandleDrop> HandleGuard<'a, T> {
     pub fn new(handle: &'a SafeHandle<T>) -> Self {
         Self {
             handle,
-            original_value: handle.as_raw(),
+            _phantom: PhantomData,
         }
     }
     
-    /// Returns the guarded handle value
+    /// Returns the raw handle value
     #[inline]
-    pub fn value(&self) -> *mut std::ffi::c_void {
-        self.original_value
+    pub fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.handle.as_raw()
     }
 }
 
@@ -350,37 +422,11 @@ impl<'a, T: HandleDrop> Deref for HandleGuard<'a, T> {
     }
 }
 
-/// Builder for creating handles with validation
+/// Builder for creating handles with specific access rights
 pub struct HandleBuilder<T: HandleDrop> {
-    handle: Option<*mut std::ffi::c_void>,
+    access_mask: u32,
+    inherit: bool,
     _marker: PhantomData<T>,
-}
-
-impl<T: HandleDrop> HandleBuilder<T> {
-    /// Creates a new handle builder
-    pub fn new() -> Self {
-        Self {
-            handle: None,
-            _marker: PhantomData,
-        }
-    }
-    
-    /// Sets the raw handle value
-    pub fn with_handle(mut self, handle: *mut std::ffi::c_void) -> Self {
-        self.handle = Some(handle);
-        self
-    }
-    
-    /// Builds the safe handle
-    pub fn build(self) -> Result<SafeHandle<T>, MapperError> {
-        match self.handle {
-            Some(h) => SafeHandle::new(h),
-            None => Err(MapperError::InvalidHandle {
-                handle_type: T::type_name(),
-                reason: "no handle value provided",
-            }),
-        }
-    }
 }
 
 impl<T: HandleDrop> Default for HandleBuilder<T> {
@@ -389,48 +435,68 @@ impl<T: HandleDrop> Default for HandleBuilder<T> {
     }
 }
 
+impl<T: HandleDrop> HandleBuilder<T> {
+    /// Creates a new handle builder with default settings
+    pub fn new() -> Self {
+        Self {
+            access_mask: 0,
+            inherit: false,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Sets the desired access mask
+    pub fn access(mut self, mask: u32) -> Self {
+        self.access_mask = mask;
+        self
+    }
+    
+    /// Sets whether the handle should be inheritable
+    pub fn inheritable(mut self, inherit: bool) -> Self {
+        self.inherit = inherit;
+        self
+    }
+    
+    /// Returns the configured access mask
+    pub fn access_mask(&self) -> u32 {
+        self.access_mask
+    }
+    
+    /// Returns whether the handle is inheritable
+    pub fn is_inheritable(&self) -> bool {
+        self.inherit
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     
-    struct MockHandleDrop;
+    #[test]
+    fn test_handle_stats() {
+        HandleStats::reset();
+        let stats = HandleStats::current();
+        assert_eq!(stats.created, 0);
+        assert_eq!(stats.closed, 0);
+        assert_eq!(stats.active, 0);
+    }
     
-    impl HandleDrop for MockHandleDrop {
-        fn drop_handle(_handle: *mut std::ffi::c_void) {
-            // No-op for testing
-        }
+    #[test]
+    fn test_invalid_handle_creation() {
+        let result = ProcessHandle::new(std::ptr::null_mut());
+        assert!(result.is_err());
         
-        fn type_name() -> &'static str {
-            "Mock"
-        }
-    }
-    
-    #[test]
-    fn test_safe_handle_creation() {
-        let raw = 0x1234usize as *mut std::ffi::c_void;
-        let handle = SafeHandle::<MockHandleDrop>::new(raw);
-        assert!(handle.is_ok());
-    }
-    
-    #[test]
-    fn test_null_handle_rejected() {
-        let handle = SafeHandle::<MockHandleDrop>::new(std::ptr::null_mut());
-        assert!(handle.is_err());
-    }
-    
-    #[test]
-    fn test_invalid_handle_rejected() {
-        let handle = SafeHandle::<MockHandleDrop>::new(SafeHandle::<MockHandleDrop>::INVALID_HANDLE);
-        assert!(handle.is_err());
+        let result = ProcessHandle::new(SafeHandle::<ProcessHandleDrop>::INVALID_HANDLE);
+        assert!(result.is_err());
     }
     
     #[test]
     fn test_handle_builder() {
-        let raw = 0x5678usize as *mut std::ffi::c_void;
-        let handle = HandleBuilder::<MockHandleDrop>::new()
-            .with_handle(raw)
-            .build();
-        assert!(handle.is_ok());
-        assert_eq!(handle.unwrap().as_raw(), raw);
+        let builder = HandleBuilder::<ProcessHandleDrop>::new()
+            .access(0x1F0FFF)
+            .inheritable(true);
+        
+        assert_eq!(builder.access_mask(), 0x1F0FFF);
+        assert!(builder.is_inheritable());
     }
 }
