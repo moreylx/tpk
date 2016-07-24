@@ -47,6 +47,48 @@ pub enum MemoryProtection {
     WriteCombine = 0x400,
 }
 
+impl MemoryProtection {
+    /// Combines multiple protection flags
+    pub fn combine(flags: &[MemoryProtection]) -> u32 {
+        flags.iter().fold(0u32, |acc, &flag| acc | flag as u32)
+    }
+
+    /// Check if protection allows reading
+    pub fn is_readable(self) -> bool {
+        matches!(
+            self,
+            MemoryProtection::ReadOnly
+                | MemoryProtection::ReadWrite
+                | MemoryProtection::WriteCopy
+                | MemoryProtection::ExecuteRead
+                | MemoryProtection::ExecuteReadWrite
+                | MemoryProtection::ExecuteWriteCopy
+        )
+    }
+
+    /// Check if protection allows writing
+    pub fn is_writable(self) -> bool {
+        matches!(
+            self,
+            MemoryProtection::ReadWrite
+                | MemoryProtection::WriteCopy
+                | MemoryProtection::ExecuteReadWrite
+                | MemoryProtection::ExecuteWriteCopy
+        )
+    }
+
+    /// Check if protection allows execution
+    pub fn is_executable(self) -> bool {
+        matches!(
+            self,
+            MemoryProtection::Execute
+                | MemoryProtection::ExecuteRead
+                | MemoryProtection::ExecuteReadWrite
+                | MemoryProtection::ExecuteWriteCopy
+        )
+    }
+}
+
 /// Memory allocation type flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -59,6 +101,13 @@ pub enum AllocationType {
     Physical = 0x400000,
     TopDown = 0x100000,
     WriteWatch = 0x200000,
+}
+
+impl AllocationType {
+    /// Combines multiple allocation flags
+    pub fn combine(flags: &[AllocationType]) -> u32 {
+        flags.iter().fold(0u32, |acc, &flag| acc | flag as u32)
+    }
 }
 
 /// Memory free type flags
@@ -105,25 +154,44 @@ impl From<u32> for ThreadState {
     }
 }
 
-/// Thread context structure for x64
-#[repr(C, align(16))]
+/// Thread priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(i32)]
+pub enum ThreadPriority {
+    Idle = -15,
+    Lowest = -2,
+    BelowNormal = -1,
+    Normal = 0,
+    AboveNormal = 1,
+    Highest = 2,
+    TimeCritical = 15,
+}
+
+impl TryFrom<i32> for ThreadPriority {
+    type Error = MapperError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            -15 => Ok(ThreadPriority::Idle),
+            -2 => Ok(ThreadPriority::Lowest),
+            -1 => Ok(ThreadPriority::BelowNormal),
+            0 => Ok(ThreadPriority::Normal),
+            1 => Ok(ThreadPriority::AboveNormal),
+            2 => Ok(ThreadPriority::Highest),
+            15 => Ok(ThreadPriority::TimeCritical),
+            _ => Err(MapperError::InvalidParameter(format!(
+                "Invalid thread priority: {}",
+                value
+            ))),
+        }
+    }
+}
+
+/// CPU context for thread state capture
 #[derive(Debug, Clone)]
+#[repr(C, align(16))]
 pub struct ThreadContext {
-    pub p1_home: u64,
-    pub p2_home: u64,
-    pub p3_home: u64,
-    pub p4_home: u64,
-    pub p5_home: u64,
-    pub p6_home: u64,
     pub context_flags: u32,
-    pub mx_csr: u32,
-    pub seg_cs: u16,
-    pub seg_ds: u16,
-    pub seg_es: u16,
-    pub seg_fs: u16,
-    pub seg_gs: u16,
-    pub seg_ss: u16,
-    pub eflags: u32,
     pub dr0: u64,
     pub dr1: u64,
     pub dr2: u64,
@@ -147,522 +215,737 @@ pub struct ThreadContext {
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
-    _xmm_reserved: [u8; 512],
-    _vector_reserved: [u8; 256],
+    pub rflags: u64,
+    pub cs: u16,
+    pub ds: u16,
+    pub es: u16,
+    pub fs: u16,
+    pub gs: u16,
+    pub ss: u16,
+    pub mxcsr: u32,
+    pub mxcsr_mask: u32,
+    pub xmm: [[u8; 16]; 16],
 }
 
 impl Default for ThreadContext {
     fn default() -> Self {
-        unsafe { MaybeUninit::zeroed().assume_init() }
+        Self {
+            context_flags: 0x10001F, // CONTEXT_ALL
+            dr0: 0,
+            dr1: 0,
+            dr2: 0,
+            dr3: 0,
+            dr6: 0,
+            dr7: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            rflags: 0,
+            cs: 0,
+            ds: 0,
+            es: 0,
+            fs: 0,
+            gs: 0,
+            ss: 0,
+            mxcsr: 0,
+            mxcsr_mask: 0,
+            xmm: [[0u8; 16]; 16],
+        }
     }
 }
 
-/// Memory region information
+/// Thread information structure
 #[derive(Debug, Clone)]
-pub struct MemoryRegionInfo {
-    pub base_address: usize,
-    pub allocation_base: usize,
-    pub allocation_protect: MemoryProtection,
-    pub region_size: usize,
-    pub state: u32,
-    pub protect: MemoryProtection,
-    pub region_type: u32,
+pub struct ThreadInfo {
+    pub thread_id: u32,
+    pub process_id: u32,
+    pub state: ThreadState,
+    pub priority: i32,
+    pub base_priority: i32,
+    pub start_address: usize,
+    pub teb_address: usize,
+    pub kernel_time: u64,
+    pub user_time: u64,
+    pub wait_reason: u32,
 }
 
-/// Observer trait for thread events
-pub trait ThreadObserver: Send + Sync {
-    fn on_thread_created(&self, thread_id: u32);
-    fn on_thread_terminated(&self, thread_id: u32, exit_code: u32);
-    fn on_thread_suspended(&self, thread_id: u32);
-    fn on_thread_resumed(&self, thread_id: u32);
-}
-
-/// Strategy trait for memory allocation
-pub trait AllocationStrategy: Send + Sync {
-    fn allocate(&self, size: usize, protection: MemoryProtection) -> Result<NonNull<c_void>, MapperError>;
-    fn deallocate(&self, ptr: NonNull<c_void>, size: usize) -> Result<(), MapperError>;
-    fn protect(&self, ptr: NonNull<c_void>, size: usize, protection: MemoryProtection) -> Result<MemoryProtection, MapperError>;
-}
-
-/// Default allocation strategy using virtual memory
-pub struct VirtualAllocationStrategy {
-    process_handle: usize,
-}
-
-impl VirtualAllocationStrategy {
-    pub fn new(process_handle: usize) -> Self {
-        Self { process_handle }
-    }
-    
-    pub fn for_current_process() -> Self {
-        Self { process_handle: usize::MAX }
-    }
-}
-
-impl AllocationStrategy for VirtualAllocationStrategy {
-    fn allocate(&self, size: usize, protection: MemoryProtection) -> Result<NonNull<c_void>, MapperError> {
-        // TODO: Implement actual VirtualAllocEx call
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        
-        if aligned_size == 0 {
-            return Err(MapperError::InvalidParameter("Size cannot be zero".into()));
-        }
-        
-        // Placeholder - would call NtAllocateVirtualMemory
-        Err(MapperError::NotImplemented("VirtualAlloc not yet implemented".into()))
-    }
-    
-    fn deallocate(&self, ptr: NonNull<c_void>, size: usize) -> Result<(), MapperError> {
-        // TODO: Implement actual VirtualFreeEx call
-        Err(MapperError::NotImplemented("VirtualFree not yet implemented".into()))
-    }
-    
-    fn protect(&self, ptr: NonNull<c_void>, size: usize, protection: MemoryProtection) -> Result<MemoryProtection, MapperError> {
-        // TODO: Implement actual VirtualProtectEx call
-        Err(MapperError::NotImplemented("VirtualProtect not yet implemented".into()))
-    }
-}
-
-/// RAII wrapper for allocated memory regions
-pub struct AllocatedRegion<S: AllocationStrategy> {
-    ptr: NonNull<c_void>,
-    size: usize,
-    strategy: Arc<S>,
-    _marker: PhantomData<*mut c_void>,
-}
-
-impl<S: AllocationStrategy> AllocatedRegion<S> {
-    pub fn new(strategy: Arc<S>, size: usize, protection: MemoryProtection) -> Result<Self, MapperError> {
-        let ptr = strategy.allocate(size, protection)?;
-        Ok(Self {
-            ptr,
-            size,
-            strategy,
-            _marker: PhantomData,
-        })
-    }
-    
-    pub fn as_ptr(&self) -> *mut c_void {
-        self.ptr.as_ptr()
-    }
-    
-    pub fn size(&self) -> usize {
-        self.size
-    }
-    
-    pub fn protect(&self, protection: MemoryProtection) -> Result<MemoryProtection, MapperError> {
-        self.strategy.protect(self.ptr, self.size, protection)
-    }
-    
-    /// Write data to the allocated region
-    pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), MapperError> {
-        if offset + data.len() > self.size {
-            return Err(MapperError::InvalidParameter("Write exceeds region bounds".into()));
-        }
-        
-        unsafe {
-            let dest = (self.ptr.as_ptr() as *mut u8).add(offset);
-            ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-        }
-        
-        Ok(())
-    }
-    
-    /// Read data from the allocated region
-    pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>, MapperError> {
-        if offset + len > self.size {
-            return Err(MapperError::InvalidParameter("Read exceeds region bounds".into()));
-        }
-        
-        let mut buffer = vec![0u8; len];
-        unsafe {
-            let src = (self.ptr.as_ptr() as *const u8).add(offset);
-            ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), len);
-        }
-        
-        Ok(buffer)
-    }
-}
-
-impl<S: AllocationStrategy> Drop for AllocatedRegion<S> {
-    fn drop(&mut self) {
-        let _ = self.strategy.deallocate(self.ptr, self.size);
-    }
-}
-
-unsafe impl<S: AllocationStrategy> Send for AllocatedRegion<S> {}
-unsafe impl<S: AllocationStrategy> Sync for AllocatedRegion<S> {}
-
-/// Thread handle wrapper with RAII semantics
+/// Safe handle wrapper for thread handles with RAII semantics
+#[derive(Debug)]
 pub struct ThreadHandle {
-    handle: usize,
+    handle: *mut c_void,
     thread_id: u32,
     owns_handle: bool,
-    suspended_count: AtomicUsize,
-    observers: Vec<Arc<dyn ThreadObserver>>,
 }
 
 impl ThreadHandle {
-    /// Open an existing thread by ID
-    pub fn open(thread_id: u32, access: ThreadAccess) -> Result<Self, MapperError> {
-        // TODO: Implement actual NtOpenThread call
-        Err(MapperError::NotImplemented("Thread opening not yet implemented".into()))
-    }
-    
-    /// Get the current thread
-    pub fn current() -> Self {
+    /// Creates a new thread handle from a raw handle
+    ///
+    /// # Safety
+    /// The caller must ensure the handle is valid and has appropriate access rights
+    pub unsafe fn from_raw(handle: *mut c_void, thread_id: u32, owns: bool) -> Self {
         Self {
-            handle: usize::MAX - 1, // Pseudo-handle for current thread
-            thread_id: 0, // Would be filled by GetCurrentThreadId
-            owns_handle: false,
-            suspended_count: AtomicUsize::new(0),
-            observers: Vec::new(),
+            handle,
+            thread_id,
+            owns_handle: owns,
         }
     }
-    
-    /// Register an observer for thread events
-    pub fn register_observer(&mut self, observer: Arc<dyn ThreadObserver>) {
-        self.observers.push(observer);
+
+    /// Opens an existing thread by ID
+    pub fn open(thread_id: u32, access: ThreadAccess) -> Result<Self, MapperError> {
+        Self::open_with_flags(thread_id, access as u32)
     }
-    
-    /// Get the thread ID
+
+    /// Opens an existing thread with combined access flags
+    pub fn open_with_flags(thread_id: u32, access_flags: u32) -> Result<Self, MapperError> {
+        // Simulated syscall - in real implementation would call NtOpenThread
+        let handle = unsafe { simulate_open_thread(thread_id, access_flags)? };
+
+        Ok(Self {
+            handle,
+            thread_id,
+            owns_handle: true,
+        })
+    }
+
+    /// Returns the raw handle value
+    pub fn as_raw(&self) -> *mut c_void {
+        self.handle
+    }
+
+    /// Returns the thread ID
     pub fn thread_id(&self) -> u32 {
         self.thread_id
     }
-    
-    /// Get the raw handle value
-    pub fn raw_handle(&self) -> usize {
-        self.handle
-    }
-    
-    /// Suspend the thread
+
+    /// Suspends the thread
     pub fn suspend(&self) -> Result<u32, MapperError> {
-        // TODO: Implement actual NtSuspendThread call
-        let prev_count = self.suspended_count.fetch_add(1, Ordering::SeqCst);
-        
-        for observer in &self.observers {
-            observer.on_thread_suspended(self.thread_id);
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
         }
-        
-        Ok(prev_count as u32)
+
+        unsafe { simulate_suspend_thread(self.handle) }
     }
-    
-    /// Resume the thread
+
+    /// Resumes the thread
     pub fn resume(&self) -> Result<u32, MapperError> {
-        // TODO: Implement actual NtResumeThread call
-        let prev_count = self.suspended_count.load(Ordering::SeqCst);
-        if prev_count > 0 {
-            self.suspended_count.fetch_sub(1, Ordering::SeqCst);
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
         }
-        
-        for observer in &self.observers {
-            observer.on_thread_resumed(self.thread_id);
-        }
-        
-        Ok(prev_count as u32)
+
+        unsafe { simulate_resume_thread(self.handle) }
     }
-    
-    /// Get the thread context
+
+    /// Gets the thread context
     pub fn get_context(&self, flags: u32) -> Result<ThreadContext, MapperError> {
-        // TODO: Implement actual NtGetContextThread call
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
         let mut context = ThreadContext::default();
         context.context_flags = flags;
-        
-        Err(MapperError::NotImplemented("GetContext not yet implemented".into()))
+
+        unsafe { simulate_get_thread_context(self.handle, &mut context)? };
+
+        Ok(context)
     }
-    
-    /// Set the thread context
+
+    /// Sets the thread context
     pub fn set_context(&self, context: &ThreadContext) -> Result<(), MapperError> {
-        // TODO: Implement actual NtSetContextThread call
-        Err(MapperError::NotImplemented("SetContext not yet implemented".into()))
-    }
-    
-    /// Terminate the thread
-    pub fn terminate(&self, exit_code: u32) -> Result<(), MapperError> {
-        // TODO: Implement actual NtTerminateThread call
-        for observer in &self.observers {
-            observer.on_thread_terminated(self.thread_id, exit_code);
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
         }
-        
-        Err(MapperError::NotImplemented("Terminate not yet implemented".into()))
+
+        unsafe { simulate_set_thread_context(self.handle, context) }
     }
-    
-    /// Query thread information
-    pub fn query_state(&self) -> Result<ThreadState, MapperError> {
-        // TODO: Implement actual NtQueryInformationThread call
-        Err(MapperError::NotImplemented("QueryState not yet implemented".into()))
+
+    /// Terminates the thread
+    pub fn terminate(&self, exit_code: u32) -> Result<(), MapperError> {
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        unsafe { simulate_terminate_thread(self.handle, exit_code) }
     }
-    
-    /// Wait for the thread to terminate
-    pub fn wait(&self, timeout_ms: Option<u32>) -> Result<(), MapperError> {
-        // TODO: Implement actual NtWaitForSingleObject call
-        Err(MapperError::NotImplemented("Wait not yet implemented".into()))
+
+    /// Queries thread information
+    pub fn query_info(&self) -> Result<ThreadInfo, MapperError> {
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        unsafe { simulate_query_thread_info(self.handle, self.thread_id) }
+    }
+
+    /// Sets thread priority
+    pub fn set_priority(&self, priority: ThreadPriority) -> Result<(), MapperError> {
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        unsafe { simulate_set_thread_priority(self.handle, priority as i32) }
+    }
+
+    /// Waits for the thread to terminate
+    pub fn wait(&self, timeout_ms: Option<u32>) -> Result<bool, MapperError> {
+        if self.handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        unsafe { simulate_wait_for_thread(self.handle, timeout_ms) }
+    }
+
+    /// Releases ownership of the handle without closing it
+    pub fn into_raw(mut self) -> *mut c_void {
+        self.owns_handle = false;
+        self.handle
     }
 }
 
 impl Drop for ThreadHandle {
     fn drop(&mut self) {
-        if self.owns_handle && self.handle != 0 && self.handle != usize::MAX - 1 {
-            // TODO: Close handle via NtClose
+        if self.owns_handle && !self.handle.is_null() {
+            unsafe {
+                let _ = simulate_close_handle(self.handle);
+            }
         }
     }
 }
 
-/// Factory for creating threads
-pub struct ThreadFactory {
-    default_stack_size: usize,
-    create_suspended: bool,
+unsafe impl Send for ThreadHandle {}
+unsafe impl Sync for ThreadHandle {}
+
+/// Memory region descriptor
+#[derive(Debug, Clone)]
+pub struct MemoryRegion {
+    pub base_address: usize,
+    pub allocation_base: usize,
+    pub allocation_protect: u32,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub region_type: u32,
 }
 
-impl ThreadFactory {
+impl MemoryRegion {
+    /// Checks if the region is committed
+    pub fn is_committed(&self) -> bool {
+        self.state == 0x1000 // MEM_COMMIT
+    }
+
+    /// Checks if the region is reserved
+    pub fn is_reserved(&self) -> bool {
+        self.state == 0x2000 // MEM_RESERVE
+    }
+
+    /// Checks if the region is free
+    pub fn is_free(&self) -> bool {
+        self.state == 0x10000 // MEM_FREE
+    }
+
+    /// Gets the protection as enum
+    pub fn protection(&self) -> Option<MemoryProtection> {
+        match self.protect {
+            0x01 => Some(MemoryProtection::NoAccess),
+            0x02 => Some(MemoryProtection::ReadOnly),
+            0x04 => Some(MemoryProtection::ReadWrite),
+            0x08 => Some(MemoryProtection::WriteCopy),
+            0x10 => Some(MemoryProtection::Execute),
+            0x20 => Some(MemoryProtection::ExecuteRead),
+            0x40 => Some(MemoryProtection::ExecuteReadWrite),
+            0x80 => Some(MemoryProtection::ExecuteWriteCopy),
+            _ => None,
+        }
+    }
+}
+
+/// Virtual memory allocator with RAII semantics
+#[derive(Debug)]
+pub struct VirtualAllocation {
+    base_address: NonNull<c_void>,
+    size: usize,
+    process_handle: *mut c_void,
+    owns_memory: bool,
+}
+
+impl VirtualAllocation {
+    /// Allocates virtual memory in the current process
+    pub fn allocate(
+        size: usize,
+        allocation_type: AllocationType,
+        protection: MemoryProtection,
+    ) -> Result<Self, MapperError> {
+        Self::allocate_at(None, size, allocation_type, protection)
+    }
+
+    /// Allocates virtual memory at a specific address
+    pub fn allocate_at(
+        preferred_address: Option<usize>,
+        size: usize,
+        allocation_type: AllocationType,
+        protection: MemoryProtection,
+    ) -> Result<Self, MapperError> {
+        if size == 0 {
+            return Err(MapperError::InvalidParameter(
+                "Size cannot be zero".to_string(),
+            ));
+        }
+
+        let base = unsafe {
+            simulate_virtual_alloc(
+                preferred_address.unwrap_or(0) as *mut c_void,
+                size,
+                allocation_type as u32,
+                protection as u32,
+            )?
+        };
+
+        let base_nn = NonNull::new(base)
+            .ok_or_else(|| MapperError::AllocationFailed("VirtualAlloc returned null".to_string()))?;
+
+        Ok(Self {
+            base_address: base_nn,
+            size,
+            process_handle: std::ptr::null_mut(), // Current process
+            owns_memory: true,
+        })
+    }
+
+    /// Allocates virtual memory in a remote process
+    pub fn allocate_remote(
+        process_handle: *mut c_void,
+        size: usize,
+        allocation_type: AllocationType,
+        protection: MemoryProtection,
+    ) -> Result<Self, MapperError> {
+        if process_handle.is_null() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        if size == 0 {
+            return Err(MapperError::InvalidParameter(
+                "Size cannot be zero".to_string(),
+            ));
+        }
+
+        let base = unsafe {
+            simulate_virtual_alloc_ex(
+                process_handle,
+                std::ptr::null_mut(),
+                size,
+                allocation_type as u32,
+                protection as u32,
+            )?
+        };
+
+        let base_nn = NonNull::new(base).ok_or_else(|| {
+            MapperError::AllocationFailed("VirtualAllocEx returned null".to_string())
+        })?;
+
+        Ok(Self {
+            base_address: base_nn,
+            size,
+            process_handle,
+            owns_memory: true,
+        })
+    }
+
+    /// Returns the base address of the allocation
+    pub fn base_address(&self) -> *mut c_void {
+        self.base_address.as_ptr()
+    }
+
+    /// Returns the size of the allocation
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Changes the protection of the allocated memory
+    pub fn protect(&self, new_protection: MemoryProtection) -> Result<u32, MapperError> {
+        unsafe {
+            if self.process_handle.is_null() {
+                simulate_virtual_protect(
+                    self.base_address.as_ptr(),
+                    self.size,
+                    new_protection as u32,
+                )
+            } else {
+                simulate_virtual_protect_ex(
+                    self.process_handle,
+                    self.base_address.as_ptr(),
+                    self.size,
+                    new_protection as u32,
+                )
+            }
+        }
+    }
+
+    /// Writes data to the allocation
+    pub fn write<T: Copy>(&self, offset: usize, data: &T) -> Result<(), MapperError> {
+        let data_size = mem::size_of::<T>();
+        if offset + data_size > self.size {
+            return Err(MapperError::InvalidParameter(
+                "Write would exceed allocation bounds".to_string(),
+            ));
+        }
+
+        unsafe {
+            let dest = (self.base_address.as_ptr() as *mut u8).add(offset) as *mut T;
+            if self.process_handle.is_null() {
+                ptr::write(dest, *data);
+            } else {
+                simulate_write_process_memory(
+                    self.process_handle,
+                    dest as *mut c_void,
+                    data as *const T as *const c_void,
+                    data_size,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes a slice of data to the allocation
+    pub fn write_slice<T: Copy>(&self, offset: usize, data: &[T]) -> Result<(), MapperError> {
+        let data_size = mem::size_of_val(data);
+        if offset + data_size > self.size {
+            return Err(MapperError::InvalidParameter(
+                "Write would exceed allocation bounds".to_string(),
+            ));
+        }
+
+        unsafe {
+            let dest = (self.base_address.as_ptr() as *mut u8).add(offset);
+            if self.process_handle.is_null() {
+                ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dest, data_size);
+            } else {
+                simulate_write_process_memory(
+                    self.process_handle,
+                    dest as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    data_size,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reads data from the allocation
+    pub fn read<T: Copy>(&self, offset: usize) -> Result<T, MapperError> {
+        let data_size = mem::size_of::<T>();
+        if offset + data_size > self.size {
+            return Err(MapperError::InvalidParameter(
+                "Read would exceed allocation bounds".to_string(),
+            ));
+        }
+
+        unsafe {
+            let src = (self.base_address.as_ptr() as *const u8).add(offset) as *const T;
+            if self.process_handle.is_null() {
+                Ok(ptr::read(src))
+            } else {
+                let mut result = MaybeUninit::<T>::uninit();
+                simulate_read_process_memory(
+                    self.process_handle,
+                    src as *const c_void,
+                    result.as_mut_ptr() as *mut c_void,
+                    data_size,
+                )?;
+                Ok(result.assume_init())
+            }
+        }
+    }
+
+    /// Fills the allocation with a byte value
+    pub fn fill(&self, value: u8) -> Result<(), MapperError> {
+        unsafe {
+            if self.process_handle.is_null() {
+                ptr::write_bytes(self.base_address.as_ptr() as *mut u8, value, self.size);
+                Ok(())
+            } else {
+                // For remote process, we need to write in chunks
+                let chunk = vec![value; self.size.min(4096)];
+                let mut offset = 0;
+                while offset < self.size {
+                    let write_size = (self.size - offset).min(chunk.len());
+                    let dest = (self.base_address.as_ptr() as *mut u8).add(offset);
+                    simulate_write_process_memory(
+                        self.process_handle,
+                        dest as *mut c_void,
+                        chunk.as_ptr() as *const c_void,
+                        write_size,
+                    )?;
+                    offset += write_size;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Releases ownership without freeing the memory
+    pub fn leak(mut self) -> *mut c_void {
+        self.owns_memory = false;
+        self.base_address.as_ptr()
+    }
+}
+
+impl Drop for VirtualAllocation {
+    fn drop(&mut self) {
+        if self.owns_memory {
+            unsafe {
+                if self.process_handle.is_null() {
+                    let _ = simulate_virtual_free(
+                        self.base_address.as_ptr(),
+                        0,
+                        FreeType::Release as u32,
+                    );
+                } else {
+                    let _ = simulate_virtual_free_ex(
+                        self.process_handle,
+                        self.base_address.as_ptr(),
+                        0,
+                        FreeType::Release as u32,
+                    );
+                }
+            }
+        }
+    }
+}
+
+unsafe impl Send for VirtualAllocation {}
+unsafe impl Sync for VirtualAllocation {}
+
+/// Memory scanner for pattern matching
+pub struct MemoryScanner {
+    regions: Vec<MemoryRegion>,
+    scan_executable: bool,
+    scan_writable: bool,
+    scan_readable: bool,
+}
+
+impl MemoryScanner {
+    /// Creates a new memory scanner
     pub fn new() -> Self {
         Self {
-            default_stack_size: 0, // Use system default
-            create_suspended: false,
+            regions: Vec::new(),
+            scan_executable: true,
+            scan_writable: true,
+            scan_readable: true,
         }
     }
-    
-    pub fn with_stack_size(mut self, size: usize) -> Self {
-        self.default_stack_size = size;
+
+    /// Sets whether to scan executable regions
+    pub fn with_executable(mut self, scan: bool) -> Self {
+        self.scan_executable = scan;
         self
     }
-    
-    pub fn create_suspended(mut self, suspended: bool) -> Self {
-        self.create_suspended = suspended;
+
+    /// Sets whether to scan writable regions
+    pub fn with_writable(mut self, scan: bool) -> Self {
+        self.scan_writable = scan;
         self
     }
-    
-    /// Create a new thread in the current process
-    pub fn create_local<F>(&self, _entry: F) -> Result<ThreadHandle, MapperError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        // TODO: Implement actual thread creation
-        Err(MapperError::NotImplemented("Local thread creation not yet implemented".into()))
+
+    /// Sets whether to scan readable regions
+    pub fn with_readable(mut self, scan: bool) -> Self {
+        self.scan_readable = scan;
+        self
     }
-    
-    /// Create a remote thread in another process
-    pub fn create_remote(
-        &self,
-        process_handle: usize,
-        start_address: usize,
-        parameter: usize,
-    ) -> Result<ThreadHandle, MapperError> {
-        // TODO: Implement actual NtCreateThreadEx call
-        Err(MapperError::NotImplemented("Remote thread creation not yet implemented".into()))
+
+    /// Enumerates memory regions in the current process
+    pub fn enumerate_regions(&mut self) -> Result<&[MemoryRegion], MapperError> {
+        self.regions.clear();
+
+        let mut address: usize = 0;
+        let max_address: usize = 0x7FFFFFFFFFFF; // User-mode address space limit
+
+        while address < max_address {
+            match unsafe { simulate_query_virtual_memory(address) } {
+                Ok(region) => {
+                    let next_address = region.base_address.saturating_add(region.region_size);
+                    if self.should_include_region(&region) {
+                        self.regions.push(region);
+                    }
+                    address = next_address;
+                }
+                Err(_) => {
+                    address = address.saturating_add(0x1000);
+                }
+            }
+
+            if address == 0 {
+                break; // Overflow protection
+            }
+        }
+
+        Ok(&self.regions)
+    }
+
+    /// Scans for a byte pattern with optional wildcards
+    pub fn scan_pattern(&self, pattern: &[Option<u8>]) -> Vec<usize> {
+        let mut results = Vec::new();
+
+        for region in &self.regions {
+            if !region.is_committed() {
+                continue;
+            }
+
+            // Read region memory
+            let data = match self.read_region_safe(region) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Search for pattern
+            for i in 0..data.len().saturating_sub(pattern.len()) {
+                let mut matched = true;
+                for (j, &pat_byte) in pattern.iter().enumerate() {
+                    if let Some(expected) = pat_byte {
+                        if data[i + j] != expected {
+                            matched = false;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    results.push(region.base_address + i);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Scans for a specific value
+    pub fn scan_value<T: Copy + PartialEq>(&self, value: T) -> Vec<usize> {
+        let mut results = Vec::new();
+        let value_size = mem::size_of::<T>();
+
+        for region in &self.regions {
+            if !region.is_committed() || region.region_size < value_size {
+                continue;
+            }
+
+            let data = match self.read_region_safe(region) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            for i in 0..=data.len().saturating_sub(value_size) {
+                let candidate = unsafe { ptr::read_unaligned(data[i..].as_ptr() as *const T) };
+                if candidate == value {
+                    results.push(region.base_address + i);
+                }
+            }
+        }
+
+        results
+    }
+
+    fn should_include_region(&self, region: &MemoryRegion) -> bool {
+        if !region.is_committed() {
+            return false;
+        }
+
+        let prot = match region.protection() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        if self.scan_executable && prot.is_executable() {
+            return true;
+        }
+        if self.scan_writable && prot.is_writable() {
+            return true;
+        }
+        if self.scan_readable && prot.is_readable() {
+            return true;
+        }
+
+        false
+    }
+
+    fn read_region_safe(&self, region: &MemoryRegion) -> Option<Vec<u8>> {
+        if region.region_size > 256 * 1024 * 1024 {
+            // Skip regions larger than 256MB
+            return None;
+        }
+
+        let mut buffer = vec![0u8; region.region_size];
+        unsafe {
+            if ptr::copy_nonoverlapping(
+                region.base_address as *const u8,
+                buffer.as_mut_ptr(),
+                region.region_size,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+
+        Some(buffer)
     }
 }
 
-impl Default for ThreadFactory {
+impl Default for MemoryScanner {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Memory operations for cross-process memory access
-pub struct RemoteMemory {
-    process_handle: usize,
-    base_address: usize,
+/// Thread pool for parallel operations
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<crossbeam_channel::Sender<Job>>,
+    active_jobs: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
 }
 
-impl RemoteMemory {
-    pub fn new(process_handle: usize, base_address: usize) -> Self {
-        Self {
-            process_handle,
-            base_address,
-        }
-    }
-    
-    /// Read memory from the remote process
-    pub fn read(&self, offset: usize, size: usize) -> Result<Vec<u8>, MapperError> {
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        
-        let mut buffer = vec![0u8; size];
-        self.read_into(offset, &mut buffer)?;
-        Ok(buffer)
-    }
-    
-    /// Read memory into an existing buffer
-    pub fn read_into(&self, offset: usize, buffer: &mut [u8]) -> Result<usize, MapperError> {
-        // TODO: Implement actual NtReadVirtualMemory call
-        let target_address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        Err(MapperError::NotImplemented("Remote read not yet implemented".into()))
-    }
-    
-    /// Read a typed value from remote memory
-    pub fn read_value<T: Copy>(&self, offset: usize) -> Result<T, MapperError> {
-        let size = mem::size_of::<T>();
-        let data = self.read(offset, size)?;
-        
-        if data.len() != size {
-            return Err(MapperError::InvalidParameter("Incomplete read".into()));
-        }
-        
-        Ok(unsafe { ptr::read_unaligned(data.as_ptr() as *const T) })
-    }
-    
-    /// Write memory to the remote process
-    pub fn write(&self, offset: usize, data: &[u8]) -> Result<usize, MapperError> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        
-        // TODO: Implement actual NtWriteVirtualMemory call
-        let target_address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        Err(MapperError::NotImplemented("Remote write not yet implemented".into()))
-    }
-    
-    /// Write a typed value to remote memory
-    pub fn write_value<T: Copy>(&self, offset: usize, value: &T) -> Result<(), MapperError> {
-        let data = unsafe {
-            std::slice::from_raw_parts(value as *const T as *const u8, mem::size_of::<T>())
-        };
-        
-        let written = self.write(offset, data)?;
-        if written != mem::size_of::<T>() {
-            return Err(MapperError::InvalidParameter("Incomplete write".into()));
-        }
-        
-        Ok(())
-    }
-    
-    /// Query memory region information
-    pub fn query_region(&self, offset: usize) -> Result<MemoryRegionInfo, MapperError> {
-        // TODO: Implement actual NtQueryVirtualMemory call
-        let target_address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        Err(MapperError::NotImplemented("Query region not yet implemented".into()))
-    }
-    
-    /// Change memory protection
-    pub fn protect(&self, offset: usize, size: usize, protection: MemoryProtection) -> Result<MemoryProtection, MapperError> {
-        // TODO: Implement actual NtProtectVirtualMemory call
-        let target_address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        Err(MapperError::NotImplemented("Protect not yet implemented".into()))
-    }
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct Worker {
+    id: usize,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Scoped memory protection change with RAII restoration
-pub struct ProtectionGuard<'a> {
-    memory: &'a RemoteMemory,
-    offset: usize,
-    size: usize,
-    original_protection: MemoryProtection,
-}
+impl ThreadPool {
+    /// Creates a new thread pool with the specified number of workers
+    pub fn new(num_workers: usize) -> Self {
+        let num_workers = num_workers.max(1);
+        let (sender, receiver) = crossbeam_channel::unbounded::<Job>();
+        let receiver = Arc::new(receiver);
+        let active_jobs = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-impl<'a> ProtectionGuard<'a> {
-    pub fn new(
-        memory: &'a RemoteMemory,
-        offset: usize,
-        size: usize,
-        new_protection: MemoryProtection,
-    ) -> Result<Self, MapperError> {
-        let original = memory.protect(offset, size, new_protection)?;
-        
-        Ok(Self {
-            memory,
-            offset,
-            size,
-            original_protection: original,
-        })
-    }
-}
+        let mut workers = Vec::with_capacity(num_workers);
 
-impl<'a> Drop for ProtectionGuard<'a> {
-    fn drop(&mut self) {
-        let _ = self.memory.protect(self.offset, self.size, self.original_protection);
-    }
-}
+        for id in 0..num_workers {
+            let receiver = Arc::clone(&receiver);
+            let active_jobs = Arc::clone(&active_jobs);
+            let shutdown = Arc::clone(&shutdown);
 
-/// Thread-local storage slot manager
-pub struct TlsSlot {
-    index: u32,
-    allocated: AtomicBool,
-}
-
-impl TlsSlot {
-    /// Allocate a new TLS slot
-    pub fn allocate() -> Result<Self, MapperError> {
-        // TODO: Implement actual TlsAlloc call
-        Err(MapperError::NotImplemented("TLS allocation not yet implemented".into()))
-    }
-    
-    /// Get the slot index
-    pub fn index(&self) -> u32 {
-        self.index
-    }
-    
-    /// Set the value for the current thread
-    pub fn set(&self, value: usize) -> Result<(), MapperError> {
-        if !self.allocated.load(Ordering::SeqCst) {
-            return Err(MapperError::InvalidParameter("TLS slot not allocated".into()));
-        }
-        
-        // TODO: Implement actual TlsSetValue call
-        Err(MapperError::NotImplemented("TLS set not yet implemented".into()))
-    }
-    
-    /// Get the value for the current thread
-    pub fn get(&self) -> Result<usize, MapperError> {
-        if !self.allocated.load(Ordering::SeqCst) {
-            return Err(MapperError::InvalidParameter("TLS slot not allocated".into()));
-        }
-        
-        // TODO: Implement actual TlsGetValue call
-        Err(MapperError::NotImplemented("TLS get not yet implemented".into()))
-    }
-}
-
-impl Drop for TlsSlot {
-    fn drop(&mut self) {
-        if self.allocated.swap(false, Ordering::SeqCst) {
-            // TODO: Implement actual TlsFree call
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_thread_state_conversion() {
-        assert_eq!(ThreadState::from(0), ThreadState::Initialized);
-        assert_eq!(ThreadState::from(2), ThreadState::Running);
-        assert_eq!(ThreadState::from(4), ThreadState::Terminated);
-        assert_eq!(ThreadState::from(100), ThreadState::Unknown(100));
-    }
-    
-    #[test]
-    fn test_thread_context_default() {
-        let ctx = ThreadContext::default();
-        assert_eq!(ctx.rax, 0);
-        assert_eq!(ctx.rip, 0);
-    }
-    
-    #[test]
-    fn test_thread_factory_builder() {
-        let factory = ThreadFactory::new()
-            .with_stack_size(1024 * 1024)
-            .create_suspended(true);
-        
-        assert_eq!(factory.default_stack_size, 1024 * 1024);
-        assert!(factory.create_suspended);
-    }
-    
-    #[test]
-    fn test_remote_memory_address_overflow() {
-        let mem = RemoteMemory::new(0, usize::MAX);
-        let result = mem.read(1, 10);
-        assert!(result.is_err());
-    }
-}
+            let thread = std::thread::spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(job) => {
+                            active_jobs.fetch_add(1, Ordering::SeqCst);
+                            job();
+                            active_jobs.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
