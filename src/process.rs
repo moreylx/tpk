@@ -2,6 +2,9 @@ use crate::error::{Result, NtStatus};
 use crate::handle::Handle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::*;
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use std::ffi::c_void;
+use std::mem;
 
 pub struct Process {
     handle: Handle,
@@ -26,4 +29,13 @@ impl Process {
     
     pub fn handle(&self) -> HANDLE { self.handle.raw() }
     pub fn pid(&self) -> u32 { self.pid }
+    
+    pub fn read_memory<T: Copy>(&self, address: usize) -> Result<T> {
+        let mut buffer: T = unsafe { mem::zeroed() };
+        let success = unsafe {
+            ReadProcessMemory(self.handle.raw(), address as *const c_void,
+                &mut buffer as *mut T as *mut c_void, mem::size_of::<T>(), None)
+        };
+        if success.is_ok() { Ok(buffer) } else { Err(NtStatus(-1)) }
+    }
 }
