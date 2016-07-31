@@ -54,11 +54,18 @@ impl ProcessAccess {
     
     /// Combine multiple access rights
     pub fn combine(rights: &[ProcessAccess]) -> Self {
-        Self(rights.iter().fold(0, |acc, r| acc | r.0))
+        let combined = rights.iter().fold(0u32, |acc, r| acc | r.0);
+        Self(combined)
     }
     
+    /// Get the raw access value
     pub fn raw(&self) -> u32 {
         self.0
+    }
+    
+    /// Check if this access includes another
+    pub fn includes(&self, other: ProcessAccess) -> bool {
+        (self.0 & other.0) == other.0
     }
 }
 
@@ -70,54 +77,69 @@ impl std::ops::BitOr for ProcessAccess {
     }
 }
 
-/// Information about a running process
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub parent_pid: u32,
-    pub name: String,
-    pub thread_count: u32,
-    pub priority_base: i32,
+impl std::ops::BitOrAssign for ProcessAccess {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
-/// Information about a loaded module
-#[derive(Debug, Clone)]
-pub struct ModuleInfo {
-    pub base_address: usize,
-    pub size: usize,
-    pub entry_point: usize,
-    pub name: String,
-}
-
-/// Safe wrapper around a process handle with RAII cleanup
+/// RAII wrapper for process handles
+#[derive(Debug)]
 pub struct ProcessHandle {
     handle: HANDLE,
     pid: u32,
-    owns_handle: bool,
+    owned: bool,
 }
 
 impl ProcessHandle {
-    /// Open a process by PID with specified access rights
+    /// Open a process by its ID with specified access rights
     pub fn open(pid: u32, access: ProcessAccess) -> Result<Self, MapperError> {
         let handle = unsafe { OpenProcess(access.raw(), 0, pid) };
         
         if handle == 0 || handle == INVALID_HANDLE_VALUE {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
+            return Err(MapperError::ProcessOpenFailed {
+                pid,
+                error_code: unsafe { GetLastError() },
+            });
         }
         
         Ok(Self {
             handle,
             pid,
-            owns_handle: true,
+            owned: true,
         })
     }
     
-    /// Get a handle to the current process (does not need to be closed)
+    /// Get a handle to the current process (not owned, won't be closed)
     pub fn current() -> Self {
         Self {
             handle: unsafe { GetCurrentProcess() },
             pid: unsafe { GetCurrentProcessId() },
-            owns_handle: false,
+            owned: false,
+        }
+    }
+    
+    /// Create from a raw handle (takes ownership)
+    /// 
+    /// # Safety
+    /// The caller must ensure the handle is valid and can be owned
+    pub unsafe fn from_raw_owned(handle: HANDLE, pid: u32) -> Self {
+        Self {
+            handle,
+            pid,
+            owned: true,
+        }
+    }
+    
+    /// Create from a raw handle without taking ownership
+    /// 
+    /// # Safety
+    /// The caller must ensure the handle remains valid for the lifetime of this wrapper
+    pub unsafe fn from_raw_borrowed(handle: HANDLE, pid: u32) -> Self {
+        Self {
+            handle,
+            pid,
+            owned: false,
         }
     }
     
@@ -137,7 +159,10 @@ impl ProcessHandle {
         let result = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
         
         if result == 0 {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
+            return Err(MapperError::SystemCallFailed {
+                function: "GetExitCodeProcess",
+                error_code: unsafe { GetLastError() },
+            });
         }
         
         Ok(exit_code == STILL_ACTIVE)
@@ -149,7 +174,10 @@ impl ProcessHandle {
         let result = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
         
         if result == 0 {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
+            return Err(MapperError::SystemCallFailed {
+                function: "GetExitCodeProcess",
+                error_code: unsafe { GetLastError() },
+            });
         }
         
         if exit_code == STILL_ACTIVE {
@@ -159,186 +187,80 @@ impl ProcessHandle {
         }
     }
     
-    /// Terminate the process with the given exit code
+    /// Terminate the process with the specified exit code
     pub fn terminate(&self, exit_code: u32) -> Result<(), MapperError> {
         let result = unsafe { TerminateProcess(self.handle, exit_code) };
         
         if result == 0 {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
+            return Err(MapperError::SystemCallFailed {
+                function: "TerminateProcess",
+                error_code: unsafe { GetLastError() },
+            });
         }
         
         Ok(())
     }
     
-    /// Enumerate loaded modules in the process
-    pub fn modules(&self) -> Result<Vec<ModuleInfo>, MapperError> {
-        let mut modules: [HANDLE; 1024] = [0; 1024];
-        let mut bytes_needed: u32 = 0;
+    /// Duplicate this handle (creates a new owned handle)
+    pub fn duplicate(&self) -> Result<Self, MapperError> {
+        use windows_sys::Win32::Foundation::DuplicateHandle;
+        use windows_sys::Win32::System::Threading::DUPLICATE_SAME_ACCESS;
+        
+        let current = unsafe { GetCurrentProcess() };
+        let mut new_handle: HANDLE = 0;
         
         let result = unsafe {
-            K32EnumProcessModules(
+            DuplicateHandle(
+                current,
                 self.handle,
-                modules.as_mut_ptr() as *mut _,
-                (modules.len() * mem::size_of::<HANDLE>()) as u32,
-                &mut bytes_needed,
+                current,
+                &mut new_handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
             )
         };
         
         if result == 0 {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
+            return Err(MapperError::SystemCallFailed {
+                function: "DuplicateHandle",
+                error_code: unsafe { GetLastError() },
+            });
         }
         
-        let module_count = bytes_needed as usize / mem::size_of::<HANDLE>();
-        let mut module_infos = Vec::with_capacity(module_count);
-        
-        for i in 0..module_count {
-            let module_handle = modules[i];
-            
-            // Get module name
-            let mut name_buf: [u16; 260] = [0; 260];
-            let name_len = unsafe {
-                K32GetModuleBaseNameW(
-                    self.handle,
-                    module_handle,
-                    name_buf.as_mut_ptr(),
-                    name_buf.len() as u32,
-                )
-            };
-            
-            let name = if name_len > 0 {
-                OsString::from_wide(&name_buf[..name_len as usize])
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                String::from("<unknown>")
-            };
-            
-            // Get module info
-            let mut mod_info: MODULEINFO = unsafe { mem::zeroed() };
-            let info_result = unsafe {
-                K32GetModuleInformation(
-                    self.handle,
-                    module_handle,
-                    &mut mod_info,
-                    mem::size_of::<MODULEINFO>() as u32,
-                )
-            };
-            
-            if info_result != 0 {
-                module_infos.push(ModuleInfo {
-                    base_address: mod_info.lpBaseOfDll as usize,
-                    size: mod_info.SizeOfImage as usize,
-                    entry_point: mod_info.EntryPoint as usize,
-                    name,
-                });
-            }
-        }
-        
-        Ok(module_infos)
-    }
-    
-    /// Find a module by name (case-insensitive)
-    pub fn find_module(&self, name: &str) -> Result<Option<ModuleInfo>, MapperError> {
-        let modules = self.modules()?;
-        let name_lower = name.to_lowercase();
-        
-        Ok(modules.into_iter().find(|m| m.name.to_lowercase() == name_lower))
+        Ok(Self {
+            handle: new_handle,
+            pid: self.pid,
+            owned: true,
+        })
     }
 }
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
-        if self.owns_handle && self.handle != 0 && self.handle != INVALID_HANDLE_VALUE {
+        if self.owned && self.handle != 0 && self.handle != INVALID_HANDLE_VALUE {
             unsafe { CloseHandle(self.handle) };
         }
     }
 }
 
-// Safety: ProcessHandle can be sent between threads
+// ProcessHandle is Send but not Sync (handle operations aren't thread-safe)
 unsafe impl Send for ProcessHandle {}
 
-/// Process enumerator using toolhelp snapshots
-pub struct ProcessEnumerator {
-    snapshot: HANDLE,
-    first_call: bool,
+/// Information about a running process
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub thread_count: u32,
+    pub base_priority: i32,
+    pub name: String,
 }
 
-impl ProcessEnumerator {
-    /// Create a new process enumerator
-    pub fn new() -> Result<Self, MapperError> {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(MapperError::from_raw(unsafe { GetLastError() } as i32));
-        }
-        
-        Ok(Self {
-            snapshot,
-            first_call: true,
-        })
-    }
-    
-    /// Collect all processes into a vector
-    pub fn collect_all(self) -> Result<Vec<ProcessInfo>, MapperError> {
-        self.collect()
-    }
-    
-    /// Find a process by name (case-insensitive)
-    pub fn find_by_name(name: &str) -> Result<Option<ProcessInfo>, MapperError> {
-        let name_lower = name.to_lowercase();
-        let enumerator = Self::new()?;
-        
-        for result in enumerator {
-            let info = result?;
-            if info.name.to_lowercase() == name_lower {
-                return Ok(Some(info));
-            }
-        }
-        
-        Ok(None)
-    }
-    
-    /// Find all processes matching a name (case-insensitive)
-    pub fn find_all_by_name(name: &str) -> Result<Vec<ProcessInfo>, MapperError> {
-        let name_lower = name.to_lowercase();
-        let enumerator = Self::new()?;
-        let mut results = Vec::new();
-        
-        for result in enumerator {
-            let info = result?;
-            if info.name.to_lowercase() == name_lower {
-                results.push(info);
-            }
-        }
-        
-        Ok(results)
-    }
-}
-
-impl Iterator for ProcessEnumerator {
-    type Item = Result<ProcessInfo, MapperError>;
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
-        entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
-        
-        let result = if self.first_call {
-            self.first_call = false;
-            unsafe { Process32FirstW(self.snapshot, &mut entry) }
-        } else {
-            unsafe { Process32NextW(self.snapshot, &mut entry) }
-        };
-        
-        if result == 0 {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_NO_MORE_FILES {
-                return None;
-            }
-            return Some(Err(MapperError::from_raw(error as i32)));
-        }
-        
-        // Find the null terminator in the name
-        let name_len = entry.szExeFile.iter()
+impl ProcessInfo {
+    fn from_entry(entry: &PROCESSENTRY32W) -> Self {
+        let name_len = entry.szExeFile
+            .iter()
             .position(|&c| c == 0)
             .unwrap_or(entry.szExeFile.len());
         
@@ -346,100 +268,496 @@ impl Iterator for ProcessEnumerator {
             .to_string_lossy()
             .into_owned();
         
-        Some(Ok(ProcessInfo {
+        Self {
             pid: entry.th32ProcessID,
             parent_pid: entry.th32ParentProcessID,
-            name,
             thread_count: entry.cntThreads,
-            priority_base: entry.pcPriClassBase as i32,
-        }))
-    }
-}
-
-impl Drop for ProcessEnumerator {
-    fn drop(&mut self) {
-        if self.snapshot != INVALID_HANDLE_VALUE {
-            unsafe { CloseHandle(self.snapshot) };
+            base_priority: entry.pcPriClassBase as i32,
+            name,
         }
     }
 }
 
-/// Observer pattern for process events
-pub trait ProcessObserver: Send + Sync {
-    fn on_process_start(&self, info: &ProcessInfo);
-    fn on_process_exit(&self, pid: u32, exit_code: u32);
-    fn on_module_load(&self, pid: u32, module: &ModuleInfo);
+/// Information about a loaded module
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub base_address: usize,
+    pub size: usize,
+    pub entry_point: usize,
+    pub name: String,
 }
 
-/// Process watcher that monitors process lifecycle events
-pub struct ProcessWatcher {
-    observers: Vec<Arc<dyn ProcessObserver>>,
-    watched_processes: HashMap<u32, ProcessHandle>,
-    // TODO: Implement background monitoring thread
+/// Strategy trait for process filtering during enumeration
+pub trait ProcessFilter: Send + Sync {
+    fn matches(&self, info: &ProcessInfo) -> bool;
 }
 
-impl ProcessWatcher {
-    pub fn new() -> Self {
+/// Filter that matches all processes
+pub struct AllProcessesFilter;
+
+impl ProcessFilter for AllProcessesFilter {
+    fn matches(&self, _info: &ProcessInfo) -> bool {
+        true
+    }
+}
+
+/// Filter by process name (case-insensitive)
+pub struct NameFilter {
+    name: String,
+    exact: bool,
+}
+
+impl NameFilter {
+    pub fn exact(name: impl Into<String>) -> Self {
         Self {
-            observers: Vec::new(),
-            watched_processes: HashMap::new(),
+            name: name.into().to_lowercase(),
+            exact: true,
         }
     }
     
-    pub fn add_observer(&mut self, observer: Arc<dyn ProcessObserver>) {
-        self.observers.push(observer);
-    }
-    
-    pub fn remove_observer(&mut self, observer: &Arc<dyn ProcessObserver>) {
-        self.observers.retain(|o| !Arc::ptr_eq(o, observer));
-    }
-    
-    pub fn watch(&mut self, pid: u32) -> Result<(), MapperError> {
-        let handle = ProcessHandle::open(pid, ProcessAccess::QUERY_INFO)?;
-        self.watched_processes.insert(pid, handle);
-        Ok(())
-    }
-    
-    pub fn unwatch(&mut self, pid: u32) {
-        self.watched_processes.remove(&pid);
-    }
-    
-    /// Poll for process state changes
-    /// TODO: Implement proper event-based monitoring
-    pub fn poll(&mut self) -> Result<(), MapperError> {
-        let mut exited = Vec::new();
-        
-        for (&pid, handle) in &self.watched_processes {
-            if let Ok(Some(exit_code)) = handle.exit_code() {
-                for observer in &self.observers {
-                    observer.on_process_exit(pid, exit_code);
-                }
-                exited.push(pid);
-            }
+    pub fn contains(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into().to_lowercase(),
+            exact: false,
         }
-        
-        for pid in exited {
-            self.watched_processes.remove(&pid);
-        }
-        
-        Ok(())
     }
 }
 
-impl Default for ProcessWatcher {
+impl ProcessFilter for NameFilter {
+    fn matches(&self, info: &ProcessInfo) -> bool {
+        let process_name = info.name.to_lowercase();
+        if self.exact {
+            process_name == self.name
+        } else {
+            process_name.contains(&self.name)
+        }
+    }
+}
+
+/// Filter by process ID
+pub struct PidFilter {
+    pids: Vec<u32>,
+}
+
+impl PidFilter {
+    pub fn new(pids: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            pids: pids.into_iter().collect(),
+        }
+    }
+    
+    pub fn single(pid: u32) -> Self {
+        Self { pids: vec![pid] }
+    }
+}
+
+impl ProcessFilter for PidFilter {
+    fn matches(&self, info: &ProcessInfo) -> bool {
+        self.pids.contains(&info.pid)
+    }
+}
+
+/// Composite filter combining multiple filters with AND logic
+pub struct CompositeFilter {
+    filters: Vec<Box<dyn ProcessFilter>>,
+}
+
+impl CompositeFilter {
+    pub fn new() -> Self {
+        Self { filters: Vec::new() }
+    }
+    
+    pub fn add<F: ProcessFilter + 'static>(mut self, filter: F) -> Self {
+        self.filters.push(Box::new(filter));
+        self
+    }
+}
+
+impl Default for CompositeFilter {
     fn default() -> Self {
         Self::new()
     }
 }
 
+impl ProcessFilter for CompositeFilter {
+    fn matches(&self, info: &ProcessInfo) -> bool {
+        self.filters.iter().all(|f| f.matches(info))
+    }
+}
+
+/// Observer trait for process enumeration events
+pub trait ProcessObserver: Send + Sync {
+    fn on_process_found(&self, info: &ProcessInfo);
+    fn on_enumeration_complete(&self, count: usize);
+    fn on_enumeration_error(&self, error: &MapperError);
+}
+
+/// Default observer that does nothing
+pub struct NullObserver;
+
+impl ProcessObserver for NullObserver {
+    fn on_process_found(&self, _info: &ProcessInfo) {}
+    fn on_enumeration_complete(&self, _count: usize) {}
+    fn on_enumeration_error(&self, _error: &MapperError) {}
+}
+
+/// Logging observer for debugging
+pub struct LoggingObserver {
+    prefix: String,
+}
+
+impl LoggingObserver {
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Self { prefix: prefix.into() }
+    }
+}
+
+impl ProcessObserver for LoggingObserver {
+    fn on_process_found(&self, info: &ProcessInfo) {
+        eprintln!("{} Found process: {} (PID: {})", self.prefix, info.name, info.pid);
+    }
+    
+    fn on_enumeration_complete(&self, count: usize) {
+        eprintln!("{} Enumeration complete: {} processes found", self.prefix, count);
+    }
+    
+    fn on_enumeration_error(&self, error: &MapperError) {
+        eprintln!("{} Enumeration error: {:?}", self.prefix, error);
+    }
+}
+
+/// Process enumerator with configurable filtering and observation
+pub struct ProcessEnumerator {
+    filter: Box<dyn ProcessFilter>,
+    observers: Vec<Arc<dyn ProcessObserver>>,
+}
+
+impl ProcessEnumerator {
+    /// Create a new enumerator with default settings (all processes, no observers)
+    pub fn new() -> Self {
+        Self {
+            filter: Box::new(AllProcessesFilter),
+            observers: Vec::new(),
+        }
+    }
+    
+    /// Set the filter for process enumeration
+    pub fn with_filter<F: ProcessFilter + 'static>(mut self, filter: F) -> Self {
+        self.filter = Box::new(filter);
+        self
+    }
+    
+    /// Add an observer for enumeration events
+    pub fn with_observer<O: ProcessObserver + 'static>(mut self, observer: Arc<O>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+    
+    /// Enumerate all matching processes
+    pub fn enumerate(&self) -> Result<Vec<ProcessInfo>, MapperError> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        
+        if snapshot == INVALID_HANDLE_VALUE {
+            let error = MapperError::SystemCallFailed {
+                function: "CreateToolhelp32Snapshot",
+                error_code: unsafe { GetLastError() },
+            };
+            self.notify_error(&error);
+            return Err(error);
+        }
+        
+        // RAII cleanup for snapshot handle
+        struct SnapshotGuard(HANDLE);
+        impl Drop for SnapshotGuard {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let _guard = SnapshotGuard(snapshot);
+        
+        let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
+        entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+        
+        let mut processes = Vec::new();
+        
+        // Get first process
+        if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+            let error_code = unsafe { GetLastError() };
+            if error_code != ERROR_NO_MORE_FILES {
+                let error = MapperError::SystemCallFailed {
+                    function: "Process32FirstW",
+                    error_code,
+                };
+                self.notify_error(&error);
+                return Err(error);
+            }
+            self.notify_complete(0);
+            return Ok(processes);
+        }
+        
+        loop {
+            let info = ProcessInfo::from_entry(&entry);
+            
+            if self.filter.matches(&info) {
+                self.notify_found(&info);
+                processes.push(info);
+            }
+            
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                let error_code = unsafe { GetLastError() };
+                if error_code != ERROR_NO_MORE_FILES {
+                    let error = MapperError::SystemCallFailed {
+                        function: "Process32NextW",
+                        error_code,
+                    };
+                    self.notify_error(&error);
+                    return Err(error);
+                }
+                break;
+            }
+        }
+        
+        self.notify_complete(processes.len());
+        Ok(processes)
+    }
+    
+    fn notify_found(&self, info: &ProcessInfo) {
+        for observer in &self.observers {
+            observer.on_process_found(info);
+        }
+    }
+    
+    fn notify_complete(&self, count: usize) {
+        for observer in &self.observers {
+            observer.on_enumeration_complete(count);
+        }
+    }
+    
+    fn notify_error(&self, error: &MapperError) {
+        for observer in &self.observers {
+            observer.on_enumeration_error(error);
+        }
+    }
+}
+
+impl Default for ProcessEnumerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Factory for creating process handles with common configurations
+pub struct ProcessHandleFactory;
+
+impl ProcessHandleFactory {
+    /// Open a process for reading memory
+    pub fn for_memory_read(pid: u32) -> Result<ProcessHandle, MapperError> {
+        ProcessHandle::open(pid, ProcessAccess::VM_READ | ProcessAccess::QUERY_INFO)
+    }
+    
+    /// Open a process for writing memory
+    pub fn for_memory_write(pid: u32) -> Result<ProcessHandle, MapperError> {
+        ProcessHandle::open(
+            pid,
+            ProcessAccess::VM_READ | ProcessAccess::VM_WRITE | ProcessAccess::VM_OPERATION,
+        )
+    }
+    
+    /// Open a process for injection operations
+    pub fn for_injection(pid: u32) -> Result<ProcessHandle, MapperError> {
+        ProcessHandle::open(
+            pid,
+            ProcessAccess::VM_READ 
+                | ProcessAccess::VM_WRITE 
+                | ProcessAccess::VM_OPERATION
+                | ProcessAccess::CREATE_THREAD
+                | ProcessAccess::QUERY_INFO,
+        )
+    }
+    
+    /// Open a process with full access
+    pub fn with_full_access(pid: u32) -> Result<ProcessHandle, MapperError> {
+        ProcessHandle::open(pid, ProcessAccess::ALL)
+    }
+    
+    /// Open a process for termination
+    pub fn for_termination(pid: u32) -> Result<ProcessHandle, MapperError> {
+        ProcessHandle::open(pid, ProcessAccess::TERMINATE)
+    }
+}
+
 /// Get the current process ID
-pub fn current_pid() -> u32 {
+pub fn current_process_id() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-/// Get process ID from a handle
-pub fn pid_from_handle(handle: HANDLE) -> u32 {
-    unsafe { GetProcessId(handle) }
+/// Find a process by name (returns first match)
+pub fn find_process_by_name(name: &str) -> Result<Option<ProcessInfo>, MapperError> {
+    let enumerator = ProcessEnumerator::new()
+        .with_filter(NameFilter::exact(name));
+    
+    let processes = enumerator.enumerate()?;
+    Ok(processes.into_iter().next())
+}
+
+/// Find all processes matching a name pattern
+pub fn find_processes_by_name(name: &str) -> Result<Vec<ProcessInfo>, MapperError> {
+    let enumerator = ProcessEnumerator::new()
+        .with_filter(NameFilter::contains(name));
+    
+    enumerator.enumerate()
+}
+
+/// Get information about a specific process by PID
+pub fn get_process_info(pid: u32) -> Result<Option<ProcessInfo>, MapperError> {
+    let enumerator = ProcessEnumerator::new()
+        .with_filter(PidFilter::single(pid));
+    
+    let processes = enumerator.enumerate()?;
+    Ok(processes.into_iter().next())
+}
+
+/// Enumerate modules loaded in a process
+pub fn enumerate_modules(handle: &ProcessHandle) -> Result<Vec<ModuleInfo>, MapperError> {
+    const MAX_MODULES: usize = 1024;
+    let mut module_handles: [HANDLE; MAX_MODULES] = [0; MAX_MODULES];
+    let mut bytes_needed: u32 = 0;
+    
+    let result = unsafe {
+        K32EnumProcessModules(
+            handle.raw(),
+            module_handles.as_mut_ptr() as *mut _,
+            (MAX_MODULES * mem::size_of::<HANDLE>()) as u32,
+            &mut bytes_needed,
+        )
+    };
+    
+    if result == 0 {
+        return Err(MapperError::SystemCallFailed {
+            function: "K32EnumProcessModules",
+            error_code: unsafe { GetLastError() },
+        });
+    }
+    
+    let module_count = (bytes_needed as usize) / mem::size_of::<HANDLE>();
+    let mut modules = Vec::with_capacity(module_count);
+    
+    for i in 0..module_count {
+        let module_handle = module_handles[i];
+        
+        // Get module name
+        let mut name_buffer: [u16; 260] = [0; 260];
+        let name_len = unsafe {
+            K32GetModuleBaseNameW(
+                handle.raw(),
+                module_handle,
+                name_buffer.as_mut_ptr(),
+                name_buffer.len() as u32,
+            )
+        };
+        
+        let name = if name_len > 0 {
+            OsString::from_wide(&name_buffer[..name_len as usize])
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::from("<unknown>")
+        };
+        
+        // Get module info
+        let mut mod_info: MODULEINFO = unsafe { mem::zeroed() };
+        let info_result = unsafe {
+            K32GetModuleInformation(
+                handle.raw(),
+                module_handle,
+                &mut mod_info,
+                mem::size_of::<MODULEINFO>() as u32,
+            )
+        };
+        
+        if info_result != 0 {
+            modules.push(ModuleInfo {
+                base_address: mod_info.lpBaseOfDll as usize,
+                size: mod_info.SizeOfImage as usize,
+                entry_point: mod_info.EntryPoint as usize,
+                name,
+            });
+        }
+    }
+    
+    Ok(modules)
+}
+
+/// Find a module by name in a process
+pub fn find_module(handle: &ProcessHandle, module_name: &str) -> Result<Option<ModuleInfo>, MapperError> {
+    let modules = enumerate_modules(handle)?;
+    let target = module_name.to_lowercase();
+    
+    Ok(modules.into_iter().find(|m| m.name.to_lowercase() == target))
+}
+
+/// Process cache for frequently accessed process information
+pub struct ProcessCache {
+    cache: HashMap<u32, ProcessInfo>,
+    max_age_ms: u64,
+    last_refresh: std::time::Instant,
+}
+
+impl ProcessCache {
+    pub fn new(max_age_ms: u64) -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_age_ms,
+            last_refresh: std::time::Instant::now(),
+        }
+    }
+    
+    /// Refresh the cache if it's stale
+    pub fn refresh_if_needed(&mut self) -> Result<(), MapperError> {
+        let elapsed = self.last_refresh.elapsed().as_millis() as u64;
+        if elapsed >= self.max_age_ms {
+            self.refresh()?;
+        }
+        Ok(())
+    }
+    
+    /// Force a cache refresh
+    pub fn refresh(&mut self) -> Result<(), MapperError> {
+        let enumerator = ProcessEnumerator::new();
+        let processes = enumerator.enumerate()?;
+        
+        self.cache.clear();
+        for process in processes {
+            self.cache.insert(process.pid, process);
+        }
+        
+        self.last_refresh = std::time::Instant::now();
+        Ok(())
+    }
+    
+    /// Get a process by PID from cache
+    pub fn get(&self, pid: u32) -> Option<&ProcessInfo> {
+        self.cache.get(&pid)
+    }
+    
+    /// Find processes by name in cache
+    pub fn find_by_name(&self, name: &str) -> Vec<&ProcessInfo> {
+        let target = name.to_lowercase();
+        self.cache
+            .values()
+            .filter(|p| p.name.to_lowercase().contains(&target))
+            .collect()
+    }
+    
+    /// Get all cached processes
+    pub fn all(&self) -> impl Iterator<Item = &ProcessInfo> {
+        self.cache.values()
+    }
+    
+    /// Check if cache is stale
+    pub fn is_stale(&self) -> bool {
+        self.last_refresh.elapsed().as_millis() as u64 >= self.max_age_ms
+    }
 }
 
 #[cfg(test)]
@@ -447,26 +765,107 @@ mod tests {
     use super::*;
     
     #[test]
+    fn test_process_access_combine() {
+        let combined = ProcessAccess::combine(&[
+            ProcessAccess::VM_READ,
+            ProcessAccess::VM_WRITE,
+        ]);
+        
+        assert!(combined.includes(ProcessAccess::VM_READ));
+        assert!(combined.includes(ProcessAccess::VM_WRITE));
+        assert!(!combined.includes(ProcessAccess::TERMINATE));
+    }
+    
+    #[test]
+    fn test_process_access_bitor() {
+        let access = ProcessAccess::VM_READ | ProcessAccess::QUERY_INFO;
+        assert!(access.includes(ProcessAccess::VM_READ));
+        assert!(access.includes(ProcessAccess::QUERY_INFO));
+    }
+    
+    #[test]
     fn test_current_process() {
         let handle = ProcessHandle::current();
+        assert_eq!(handle.pid(), current_process_id());
         assert!(handle.is_running().unwrap());
-        assert_eq!(handle.pid(), current_pid());
+    }
+    
+    #[test]
+    fn test_name_filter_exact() {
+        let filter = NameFilter::exact("test.exe");
+        
+        let info = ProcessInfo {
+            pid: 1,
+            parent_pid: 0,
+            thread_count: 1,
+            base_priority: 0,
+            name: "test.exe".to_string(),
+        };
+        
+        assert!(filter.matches(&info));
+        
+        let info2 = ProcessInfo {
+            pid: 2,
+            parent_pid: 0,
+            thread_count: 1,
+            base_priority: 0,
+            name: "other.exe".to_string(),
+        };
+        
+        assert!(!filter.matches(&info2));
+    }
+    
+    #[test]
+    fn test_name_filter_contains() {
+        let filter = NameFilter::contains("test");
+        
+        let info = ProcessInfo {
+            pid: 1,
+            parent_pid: 0,
+            thread_count: 1,
+            base_priority: 0,
+            name: "mytest.exe".to_string(),
+        };
+        
+        assert!(filter.matches(&info));
+    }
+    
+    #[test]
+    fn test_composite_filter() {
+        let filter = CompositeFilter::new()
+            .add(NameFilter::contains("test"))
+            .add(PidFilter::new([1, 2, 3]));
+        
+        let info = ProcessInfo {
+            pid: 1,
+            parent_pid: 0,
+            thread_count: 1,
+            base_priority: 0,
+            name: "test.exe".to_string(),
+        };
+        
+        assert!(filter.matches(&info));
+        
+        let info2 = ProcessInfo {
+            pid: 999,
+            parent_pid: 0,
+            thread_count: 1,
+            base_priority: 0,
+            name: "test.exe".to_string(),
+        };
+        
+        assert!(!filter.matches(&info2));
     }
     
     #[test]
     fn test_process_enumeration() {
-        let enumerator = ProcessEnumerator::new().unwrap();
-        let processes: Vec<_> = enumerator.filter_map(|r| r.ok()).collect();
+        let enumerator = ProcessEnumerator::new();
+        let processes = enumerator.enumerate().unwrap();
+        
+        // Should find at least the current process
         assert!(!processes.is_empty());
         
-        // Current process should be in the list
-        let current = current_pid();
-        assert!(processes.iter().any(|p| p.pid == current));
-    }
-    
-    #[test]
-    fn test_process_access_combine() {
-        let combined = ProcessAccess::VM_READ | ProcessAccess::VM_WRITE;
-        assert_eq!(combined.raw(), PROCESS_VM_READ | PROCESS_VM_WRITE);
+        let current_pid = current_process_id();
+        assert!(processes.iter().any(|p| p.pid == current_pid));
     }
 }
