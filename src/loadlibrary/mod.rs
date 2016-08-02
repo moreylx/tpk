@@ -3,22 +3,52 @@
 //! Provides functionality for dynamic library loading, process management,
 //! and thread operations with proper RAII semantics and Windows API integration.
 
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::error::{MapperError, NtStatus};
 use crate::TraceManager::SafeHandle;
+
+/// Windows API constants
+mod constants {
+    pub const PROCESS_ALL_ACCESS: u32 = 0x1F0FFF;
+    pub const PROCESS_CREATE_THREAD: u32 = 0x0002;
+    pub const PROCESS_VM_OPERATION: u32 = 0x0008;
+    pub const PROCESS_VM_READ: u32 = 0x0010;
+    pub const PROCESS_VM_WRITE: u32 = 0x0020;
+    pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    
+    pub const THREAD_ALL_ACCESS: u32 = 0x1F03FF;
+    pub const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    pub const THREAD_GET_CONTEXT: u32 = 0x0008;
+    pub const THREAD_SET_CONTEXT: u32 = 0x0010;
+    pub const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+    
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_RELEASE: u32 = 0x8000;
+    
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    
+    pub const INFINITE: u32 = 0xFFFFFFFF;
+    pub const WAIT_OBJECT_0: u32 = 0x00000000;
+    pub const WAIT_TIMEOUT: u32 = 0x00000102;
+    pub const WAIT_FAILED: u32 = 0xFFFFFFFF;
+}
 
 /// Module handle wrapper with automatic cleanup
 #[derive(Debug)]
 pub struct ModuleHandle {
     handle: *mut std::ffi::c_void,
     path: String,
-    ref_count: Arc<std::sync::atomic::AtomicUsize>,
+    ref_count: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for ModuleHandle {}
@@ -33,7 +63,7 @@ impl ModuleHandle {
         Self {
             handle,
             path: path.into(),
-            ref_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            ref_count: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -61,6 +91,41 @@ impl ModuleHandle {
     pub fn ref_count(&self) -> usize {
         self.ref_count.load(Ordering::SeqCst)
     }
+
+    /// Retrieves a function pointer from the loaded module
+    ///
+    /// # Safety
+    /// The caller must ensure the function signature matches the actual export
+    pub unsafe fn get_proc_address<F>(&self, name: &str) -> Result<F, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        let c_name = CString::new(name)
+            .map_err(|_| MapperError::InvalidParameter("Invalid function name".into()))?;
+
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn GetProcAddress(
+                    hModule: *mut std::ffi::c_void,
+                    lpProcName: *const i8,
+                ) -> *mut std::ffi::c_void;
+            }
+
+            let proc = GetProcAddress(self.handle, c_name.as_ptr());
+            if proc.is_null() {
+                return Err(MapperError::ProcNotFound(name.to_string()));
+            }
+
+            Ok(std::mem::transmute_copy(&proc))
+        }
+
+        #[cfg(not(windows))]
+        {
+            Err(MapperError::UnsupportedPlatform)
+        }
+    }
 }
 
 impl Clone for ModuleHandle {
@@ -78,207 +143,708 @@ impl Drop for ModuleHandle {
     fn drop(&mut self) {
         let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 && !self.handle.is_null() {
-            // Last reference, free the library
             #[cfg(windows)]
             unsafe {
-                windows_sys::Win32::System::LibraryLoader::FreeLibrary(
-                    self.handle as windows_sys::Win32::Foundation::HMODULE,
-                );
+                extern "system" {
+                    fn FreeLibrary(hLibModule: *mut std::ffi::c_void) -> i32;
+                }
+                FreeLibrary(self.handle);
             }
         }
     }
 }
 
-/// Thread creation flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ThreadCreationFlags {
-    /// Thread runs immediately after creation
-    RunImmediately = 0,
-    /// Thread is created in a suspended state
-    CreateSuspended = 0x00000004,
-    /// Stack size parameter specifies initial reserve size
-    StackSizeParamIsReservation = 0x00010000,
+/// Process access rights configuration
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessAccess {
+    rights: u32,
 }
 
-/// Thread priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum ThreadPriority {
-    Idle = -15,
-    Lowest = -2,
-    BelowNormal = -1,
-    Normal = 0,
-    AboveNormal = 1,
-    Highest = 2,
-    TimeCritical = 15,
-}
-
-/// Represents a managed thread with RAII cleanup
-#[derive(Debug)]
-pub struct ManagedThread {
-    handle: SafeHandle,
-    thread_id: u32,
-    is_suspended: AtomicBool,
-}
-
-impl ManagedThread {
-    /// Creates a new managed thread wrapper
-    ///
-    /// # Safety
-    /// The handle must be a valid thread handle
-    pub unsafe fn from_raw(handle: *mut std::ffi::c_void, thread_id: u32) -> Result<Self, MapperError> {
-        if handle.is_null() {
-            return Err(MapperError::InvalidHandle);
-        }
-
-        Ok(Self {
-            handle: SafeHandle::from_raw_handle(handle as isize),
-            thread_id,
-            is_suspended: AtomicBool::new(false),
-        })
+impl ProcessAccess {
+    pub const fn all() -> Self {
+        Self { rights: constants::PROCESS_ALL_ACCESS }
     }
 
-    /// Returns the thread ID
+    pub const fn read_write() -> Self {
+        Self {
+            rights: constants::PROCESS_VM_READ 
+                | constants::PROCESS_VM_WRITE 
+                | constants::PROCESS_VM_OPERATION
+                | constants::PROCESS_QUERY_INFORMATION,
+        }
+    }
+
+    pub const fn inject() -> Self {
+        Self {
+            rights: constants::PROCESS_CREATE_THREAD
+                | constants::PROCESS_VM_OPERATION
+                | constants::PROCESS_VM_READ
+                | constants::PROCESS_VM_WRITE
+                | constants::PROCESS_QUERY_INFORMATION,
+        }
+    }
+
+    pub fn with_rights(rights: u32) -> Self {
+        Self { rights }
+    }
+
+    pub fn rights(&self) -> u32 {
+        self.rights
+    }
+}
+
+impl Default for ProcessAccess {
+    fn default() -> Self {
+        Self::read_write()
+    }
+}
+
+/// Thread state enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadState {
+    Running,
+    Suspended,
+    Waiting,
+    Terminated,
+    Unknown,
+}
+
+/// Thread context flags
+#[derive(Debug, Clone, Copy)]
+pub struct ContextFlags(u32);
+
+impl ContextFlags {
+    pub const CONTROL: Self = Self(0x00010001);
+    pub const INTEGER: Self = Self(0x00010002);
+    pub const SEGMENTS: Self = Self(0x00010004);
+    pub const FLOATING_POINT: Self = Self(0x00010008);
+    pub const DEBUG_REGISTERS: Self = Self(0x00010010);
+    pub const FULL: Self = Self(0x0001001F);
+    pub const ALL: Self = Self(0x0010003F);
+
+    pub fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Thread handle wrapper with RAII cleanup
+#[derive(Debug)]
+pub struct ThreadHandle {
+    handle: *mut std::ffi::c_void,
+    thread_id: u32,
+    owning_process: u32,
+}
+
+unsafe impl Send for ThreadHandle {}
+unsafe impl Sync for ThreadHandle {}
+
+impl ThreadHandle {
+    /// Creates a thread handle from raw values
+    ///
+    /// # Safety
+    /// The handle must be valid and obtained from proper Windows API calls
+    pub unsafe fn from_raw(
+        handle: *mut std::ffi::c_void,
+        thread_id: u32,
+        owning_process: u32,
+    ) -> Self {
+        Self {
+            handle,
+            thread_id,
+            owning_process,
+        }
+    }
+
+    pub fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.handle
+    }
+
     pub fn thread_id(&self) -> u32 {
         self.thread_id
     }
 
-    /// Checks if the thread is currently suspended
-    pub fn is_suspended(&self) -> bool {
-        self.is_suspended.load(Ordering::SeqCst)
+    pub fn owning_process(&self) -> u32 {
+        self.owning_process
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.handle.is_null()
     }
 
     /// Suspends the thread
     pub fn suspend(&self) -> Result<u32, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
         #[cfg(windows)]
         unsafe {
-            let result = windows_sys::Win32::System::Threading::SuspendThread(
-                self.handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-            );
-            if result == u32::MAX {
-                return Err(MapperError::ThreadOperationFailed);
+            extern "system" {
+                fn SuspendThread(hThread: *mut std::ffi::c_void) -> u32;
             }
-            self.is_suspended.store(true, Ordering::SeqCst);
+
+            let result = SuspendThread(self.handle);
+            if result == u32::MAX {
+                return Err(MapperError::ThreadOperationFailed("SuspendThread failed".into()));
+            }
             Ok(result)
         }
+
         #[cfg(not(windows))]
         Err(MapperError::UnsupportedPlatform)
     }
 
     /// Resumes the thread
     pub fn resume(&self) -> Result<u32, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
         #[cfg(windows)]
         unsafe {
-            let result = windows_sys::Win32::System::Threading::ResumeThread(
-                self.handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-            );
-            if result == u32::MAX {
-                return Err(MapperError::ThreadOperationFailed);
+            extern "system" {
+                fn ResumeThread(hThread: *mut std::ffi::c_void) -> u32;
             }
-            if result <= 1 {
-                self.is_suspended.store(false, Ordering::SeqCst);
+
+            let result = ResumeThread(self.handle);
+            if result == u32::MAX {
+                return Err(MapperError::ThreadOperationFailed("ResumeThread failed".into()));
             }
             Ok(result)
         }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
 
-    /// Sets the thread priority
-    pub fn set_priority(&self, priority: ThreadPriority) -> Result<(), MapperError> {
-        #[cfg(windows)]
-        unsafe {
-            let result = windows_sys::Win32::System::Threading::SetThreadPriority(
-                self.handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                priority as i32,
-            );
-            if result == 0 {
-                return Err(MapperError::ThreadOperationFailed);
-            }
-            Ok(())
-        }
         #[cfg(not(windows))]
         Err(MapperError::UnsupportedPlatform)
     }
 
     /// Waits for the thread to complete
     pub fn wait(&self, timeout_ms: Option<u32>) -> Result<WaitResult, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
         #[cfg(windows)]
         unsafe {
-            let timeout = timeout_ms.unwrap_or(windows_sys::Win32::System::Threading::INFINITE);
-            let result = windows_sys::Win32::System::Threading::WaitForSingleObject(
-                self.handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                timeout,
-            );
+            extern "system" {
+                fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+            }
+
+            let timeout = timeout_ms.unwrap_or(constants::INFINITE);
+            let result = WaitForSingleObject(self.handle, timeout);
+
             match result {
-                0 => Ok(WaitResult::Signaled),
-                0x00000080 => Ok(WaitResult::Abandoned),
-                0x00000102 => Ok(WaitResult::Timeout),
-                _ => Err(MapperError::WaitFailed),
+                constants::WAIT_OBJECT_0 => Ok(WaitResult::Signaled),
+                constants::WAIT_TIMEOUT => Ok(WaitResult::Timeout),
+                constants::WAIT_FAILED => Err(MapperError::WaitFailed),
+                _ => Ok(WaitResult::Abandoned),
             }
         }
+
         #[cfg(not(windows))]
         Err(MapperError::UnsupportedPlatform)
     }
 
     /// Gets the thread exit code
     pub fn exit_code(&self) -> Result<u32, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
         #[cfg(windows)]
         unsafe {
+            extern "system" {
+                fn GetExitCodeThread(hThread: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+            }
+
             let mut exit_code: u32 = 0;
-            let result = windows_sys::Win32::System::Threading::GetExitCodeThread(
-                self.handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                &mut exit_code,
-            );
-            if result == 0 {
-                return Err(MapperError::ThreadOperationFailed);
+            if GetExitCodeThread(self.handle, &mut exit_code) == 0 {
+                return Err(MapperError::ThreadOperationFailed("GetExitCodeThread failed".into()));
             }
             Ok(exit_code)
         }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Terminates the thread (use with caution)
+    pub fn terminate(&self, exit_code: u32) -> Result<(), MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn TerminateThread(hThread: *mut std::ffi::c_void, dwExitCode: u32) -> i32;
+            }
+
+            if TerminateThread(self.handle, exit_code) == 0 {
+                return Err(MapperError::ThreadOperationFailed("TerminateThread failed".into()));
+            }
+            Ok(())
+        }
+
         #[cfg(not(windows))]
         Err(MapperError::UnsupportedPlatform)
     }
 }
 
-/// Result of a wait operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitResult {
-    /// The object was signaled
-    Signaled,
-    /// The wait was abandoned
-    Abandoned,
-    /// The wait timed out
-    Timeout,
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            #[cfg(windows)]
+            unsafe {
+                extern "system" {
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                }
+                CloseHandle(self.handle);
+            }
+        }
+    }
 }
 
-/// Library loader with caching and management capabilities
+/// Wait operation result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitResult {
+    Signaled,
+    Timeout,
+    Abandoned,
+}
+
+/// Process handle wrapper with comprehensive process management
+#[derive(Debug)]
+pub struct ProcessHandle {
+    handle: *mut std::ffi::c_void,
+    process_id: u32,
+    access: ProcessAccess,
+    is_owned: bool,
+}
+
+unsafe impl Send for ProcessHandle {}
+unsafe impl Sync for ProcessHandle {}
+
+impl ProcessHandle {
+    /// Opens a process by its ID
+    pub fn open(process_id: u32, access: ProcessAccess) -> Result<Self, MapperError> {
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn OpenProcess(
+                    dwDesiredAccess: u32,
+                    bInheritHandle: i32,
+                    dwProcessId: u32,
+                ) -> *mut std::ffi::c_void;
+            }
+
+            let handle = OpenProcess(access.rights(), 0, process_id);
+            if handle.is_null() {
+                return Err(MapperError::ProcessOpenFailed(process_id));
+            }
+
+            Ok(Self {
+                handle,
+                process_id,
+                access,
+                is_owned: true,
+            })
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Creates a process handle from a raw handle
+    ///
+    /// # Safety
+    /// The handle must be valid
+    pub unsafe fn from_raw(
+        handle: *mut std::ffi::c_void,
+        process_id: u32,
+        access: ProcessAccess,
+        is_owned: bool,
+    ) -> Self {
+        Self {
+            handle,
+            process_id,
+            access,
+            is_owned,
+        }
+    }
+
+    pub fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.handle
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.handle.is_null()
+    }
+
+    /// Allocates memory in the target process
+    pub fn allocate_memory(
+        &self,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<RemoteMemory, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn VirtualAllocEx(
+                    hProcess: *mut std::ffi::c_void,
+                    lpAddress: *mut std::ffi::c_void,
+                    dwSize: usize,
+                    flAllocationType: u32,
+                    flProtect: u32,
+                ) -> *mut std::ffi::c_void;
+            }
+
+            let address = VirtualAllocEx(
+                self.handle,
+                ptr::null_mut(),
+                size,
+                constants::MEM_COMMIT | constants::MEM_RESERVE,
+                protection.to_windows(),
+            );
+
+            if address.is_null() {
+                return Err(MapperError::MemoryAllocationFailed(size));
+            }
+
+            Ok(RemoteMemory {
+                process_handle: self.handle,
+                address: address as usize,
+                size,
+                protection,
+            })
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Writes data to the target process memory
+    pub fn write_memory(&self, address: usize, data: &[u8]) -> Result<usize, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn WriteProcessMemory(
+                    hProcess: *mut std::ffi::c_void,
+                    lpBaseAddress: *mut std::ffi::c_void,
+                    lpBuffer: *const std::ffi::c_void,
+                    nSize: usize,
+                    lpNumberOfBytesWritten: *mut usize,
+                ) -> i32;
+            }
+
+            let mut bytes_written: usize = 0;
+            let result = WriteProcessMemory(
+                self.handle,
+                address as *mut std::ffi::c_void,
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len(),
+                &mut bytes_written,
+            );
+
+            if result == 0 {
+                return Err(MapperError::MemoryWriteFailed(address));
+            }
+
+            Ok(bytes_written)
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Reads data from the target process memory
+    pub fn read_memory(&self, address: usize, size: usize) -> Result<Vec<u8>, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn ReadProcessMemory(
+                    hProcess: *mut std::ffi::c_void,
+                    lpBaseAddress: *const std::ffi::c_void,
+                    lpBuffer: *mut std::ffi::c_void,
+                    nSize: usize,
+                    lpNumberOfBytesRead: *mut usize,
+                ) -> i32;
+            }
+
+            let mut buffer = vec![0u8; size];
+            let mut bytes_read: usize = 0;
+
+            let result = ReadProcessMemory(
+                self.handle,
+                address as *const std::ffi::c_void,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                size,
+                &mut bytes_read,
+            );
+
+            if result == 0 {
+                return Err(MapperError::MemoryReadFailed(address));
+            }
+
+            buffer.truncate(bytes_read);
+            Ok(buffer)
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Creates a remote thread in the target process
+    pub fn create_remote_thread(
+        &self,
+        start_address: usize,
+        parameter: usize,
+    ) -> Result<ThreadHandle, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn CreateRemoteThread(
+                    hProcess: *mut std::ffi::c_void,
+                    lpThreadAttributes: *mut std::ffi::c_void,
+                    dwStackSize: usize,
+                    lpStartAddress: *mut std::ffi::c_void,
+                    lpParameter: *mut std::ffi::c_void,
+                    dwCreationFlags: u32,
+                    lpThreadId: *mut u32,
+                ) -> *mut std::ffi::c_void;
+            }
+
+            let mut thread_id: u32 = 0;
+            let handle = CreateRemoteThread(
+                self.handle,
+                ptr::null_mut(),
+                0,
+                start_address as *mut std::ffi::c_void,
+                parameter as *mut std::ffi::c_void,
+                0,
+                &mut thread_id,
+            );
+
+            if handle.is_null() {
+                return Err(MapperError::ThreadCreationFailed);
+            }
+
+            Ok(ThreadHandle::from_raw(handle, thread_id, self.process_id))
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Gets the exit code of the process
+    pub fn exit_code(&self) -> Result<u32, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+            }
+
+            let mut exit_code: u32 = 0;
+            if GetExitCodeProcess(self.handle, &mut exit_code) == 0 {
+                return Err(MapperError::ProcessQueryFailed);
+            }
+            Ok(exit_code)
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Waits for the process to exit
+    pub fn wait(&self, timeout_ms: Option<u32>) -> Result<WaitResult, MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+            }
+
+            let timeout = timeout_ms.unwrap_or(constants::INFINITE);
+            let result = WaitForSingleObject(self.handle, timeout);
+
+            match result {
+                constants::WAIT_OBJECT_0 => Ok(WaitResult::Signaled),
+                constants::WAIT_TIMEOUT => Ok(WaitResult::Timeout),
+                constants::WAIT_FAILED => Err(MapperError::WaitFailed),
+                _ => Ok(WaitResult::Abandoned),
+            }
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+
+    /// Terminates the process
+    pub fn terminate(&self, exit_code: u32) -> Result<(), MapperError> {
+        if !self.is_valid() {
+            return Err(MapperError::InvalidHandle);
+        }
+
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
+            }
+
+            if TerminateProcess(self.handle, exit_code) == 0 {
+                return Err(MapperError::ProcessTerminationFailed);
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        Err(MapperError::UnsupportedPlatform)
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        if self.is_owned && !self.handle.is_null() {
+            #[cfg(windows)]
+            unsafe {
+                extern "system" {
+                    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+                }
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+/// Memory protection flags
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryProtection {
+    ReadWrite,
+    ExecuteReadWrite,
+    ReadOnly,
+    Execute,
+    NoAccess,
+}
+
+impl MemoryProtection {
+    fn to_windows(&self) -> u32 {
+        match self {
+            MemoryProtection::ReadWrite => constants::PAGE_READWRITE,
+            MemoryProtection::ExecuteReadWrite => constants::PAGE_EXECUTE_READWRITE,
+            MemoryProtection::ReadOnly => 0x02,
+            MemoryProtection::Execute => 0x10,
+            MemoryProtection::NoAccess => 0x01,
+        }
+    }
+}
+
+/// Remote memory allocation with automatic cleanup
+#[derive(Debug)]
+pub struct RemoteMemory {
+    process_handle: *mut std::ffi::c_void,
+    address: usize,
+    size: usize,
+    protection: MemoryProtection,
+}
+
+impl RemoteMemory {
+    pub fn address(&self) -> usize {
+        self.address
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn protection(&self) -> MemoryProtection {
+        self.protection
+    }
+
+    /// Prevents automatic deallocation, returning the raw address
+    pub fn leak(mut self) -> usize {
+        let addr = self.address;
+        self.address = 0;
+        addr
+    }
+}
+
+impl Drop for RemoteMemory {
+    fn drop(&mut self) {
+        if self.address != 0 && !self.process_handle.is_null() {
+            #[cfg(windows)]
+            unsafe {
+                extern "system" {
+                    fn VirtualFreeEx(
+                        hProcess: *mut std::ffi::c_void,
+                        lpAddress: *mut std::ffi::c_void,
+                        dwSize: usize,
+                        dwFreeType: u32,
+                    ) -> i32;
+                }
+                VirtualFreeEx(
+                    self.process_handle,
+                    self.address as *mut std::ffi::c_void,
+                    0,
+                    constants::MEM_RELEASE,
+                );
+            }
+        }
+    }
+}
+
+/// Library loader with caching and reference counting
 pub struct LibraryLoader {
-    loaded_modules: std::sync::RwLock<std::collections::HashMap<String, ModuleHandle>>,
-    search_paths: std::sync::RwLock<Vec<String>>,
+    cache: RwLock<HashMap<String, ModuleHandle>>,
+    search_paths: RwLock<Vec<String>>,
 }
 
 impl LibraryLoader {
     /// Creates a new library loader instance
     pub fn new() -> Self {
         Self {
-            loaded_modules: std::sync::RwLock::new(std::collections::HashMap::new()),
-            search_paths: std::sync::RwLock::new(Vec::new()),
+            cache: RwLock::new(HashMap::new()),
+            search_paths: RwLock::new(Vec::new()),
         }
     }
 
     /// Adds a search path for library resolution
     pub fn add_search_path(&self, path: impl Into<String>) {
-        let mut paths = self.search_paths.write().unwrap();
-        paths.push(path.into());
+        if let Ok(mut paths) = self.search_paths.write() {
+            paths.push(path.into());
+        }
     }
 
     /// Loads a library by name or path
-    pub fn load_library(&self, name: &str) -> Result<ModuleHandle, MapperError> {
-        // Check if already loaded
-        {
-            let modules = self.loaded_modules.read().unwrap();
-            if let Some(handle) = modules.get(name) {
+    pub fn load(&self, name: &str) -> Result<ModuleHandle, MapperError> {
+        // Check cache first
+        if let Ok(cache) = self.cache.read() {
+            if let Some(handle) = cache.get(name) {
                 return Ok(handle.clone());
             }
         }
@@ -286,10 +852,9 @@ impl LibraryLoader {
         // Try to load the library
         let handle = self.load_library_internal(name)?;
 
-        // Cache the handle
-        {
-            let mut modules = self.loaded_modules.write().unwrap();
-            modules.insert(name.to_string(), handle.clone());
+        // Cache the result
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(name.to_string(), handle.clone());
         }
 
         Ok(handle)
@@ -298,65 +863,63 @@ impl LibraryLoader {
     fn load_library_internal(&self, name: &str) -> Result<ModuleHandle, MapperError> {
         #[cfg(windows)]
         {
-            let wide_name = self.to_wide_string(name);
+            let wide_name: Vec<u16> = OsStr::new(name)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
             unsafe {
-                let handle = windows_sys::Win32::System::LibraryLoader::LoadLibraryW(
-                    wide_name.as_ptr(),
-                );
+                extern "system" {
+                    fn LoadLibraryW(lpLibFileName: *const u16) -> *mut std::ffi::c_void;
+                }
+
+                let handle = LoadLibraryW(wide_name.as_ptr());
                 if handle.is_null() {
-                    return Err(MapperError::LibraryLoadFailed);
+                    // Try search paths
+                    if let Ok(paths) = self.search_paths.read() {
+                        for search_path in paths.iter() {
+                            let full_path = format!("{}\\{}", search_path, name);
+                            let wide_path: Vec<u16> = OsStr::new(&full_path)
+                                .encode_wide()
+                                .chain(std::iter::once(0))
+                                .collect();
+
+                            let handle = LoadLibraryW(wide_path.as_ptr());
+                            if !handle.is_null() {
+                                return Ok(ModuleHandle::from_raw(handle, full_path));
+                            }
+                        }
+                    }
+                    return Err(MapperError::LibraryLoadFailed(name.to_string()));
                 }
-                Ok(ModuleHandle::from_raw(handle as *mut std::ffi::c_void, name))
+
+                Ok(ModuleHandle::from_raw(handle, name))
             }
         }
+
         #[cfg(not(windows))]
         Err(MapperError::UnsupportedPlatform)
     }
 
-    /// Gets a procedure address from a loaded module
-    pub fn get_proc_address(
-        &self,
-        module: &ModuleHandle,
-        proc_name: &str,
-    ) -> Result<*const std::ffi::c_void, MapperError> {
-        #[cfg(windows)]
-        {
-            let c_name = CString::new(proc_name).map_err(|_| MapperError::InvalidParameter)?;
-            unsafe {
-                let addr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                    module.as_raw() as windows_sys::Win32::Foundation::HMODULE,
-                    c_name.as_ptr() as *const u8,
-                );
-                if addr.is_none() {
-                    return Err(MapperError::ProcNotFound);
-                }
-                Ok(addr.unwrap() as *const std::ffi::c_void)
-            }
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-
-    /// Unloads a library by name
-    pub fn unload_library(&self, name: &str) -> Result<(), MapperError> {
-        let mut modules = self.loaded_modules.write().unwrap();
-        if modules.remove(name).is_some() {
-            Ok(())
+    /// Unloads a library from the cache
+    pub fn unload(&self, name: &str) -> bool {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(name).is_some()
         } else {
-            Err(MapperError::ModuleNotFound)
+            false
         }
     }
 
-    /// Returns the number of loaded modules
-    pub fn loaded_count(&self) -> usize {
-        self.loaded_modules.read().unwrap().len()
+    /// Clears the entire cache
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
     }
 
-    fn to_wide_string(&self, s: &str) -> Vec<u16> {
-        OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+    /// Returns the number of cached libraries
+    pub fn cached_count(&self) -> usize {
+        self.cache.read().map(|c| c.len()).unwrap_or(0)
     }
 }
 
@@ -366,292 +929,29 @@ impl Default for LibraryLoader {
     }
 }
 
-/// Thread factory for creating and managing threads
-pub struct ThreadFactory {
-    created_threads: std::sync::Mutex<Vec<Arc<ManagedThread>>>,
-}
+/// Process enumeration utilities
+pub struct ProcessEnumerator;
 
-impl ThreadFactory {
-    /// Creates a new thread factory
-    pub fn new() -> Self {
-        Self {
-            created_threads: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Creates a new thread with the specified start routine
-    ///
-    /// # Safety
-    /// The start_routine must be a valid function pointer
-    pub unsafe fn create_thread(
-        &self,
-        start_routine: *const std::ffi::c_void,
-        parameter: *mut std::ffi::c_void,
-        flags: ThreadCreationFlags,
-        stack_size: usize,
-    ) -> Result<Arc<ManagedThread>, MapperError> {
-        #[cfg(windows)]
-        {
-            let mut thread_id: u32 = 0;
-            let handle = windows_sys::Win32::System::Threading::CreateThread(
-                ptr::null(),
-                stack_size,
-                Some(std::mem::transmute(start_routine)),
-                parameter,
-                flags as u32,
-                &mut thread_id,
-            );
-
-            if handle.is_null() {
-                return Err(MapperError::ThreadCreationFailed);
-            }
-
-            let thread = Arc::new(ManagedThread::from_raw(
-                handle as *mut std::ffi::c_void,
-                thread_id,
-            )?);
-
-            if flags == ThreadCreationFlags::CreateSuspended {
-                thread.is_suspended.store(true, Ordering::SeqCst);
-            }
-
-            let mut threads = self.created_threads.lock().unwrap();
-            threads.push(Arc::clone(&thread));
-
-            Ok(thread)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-
-    /// Creates a remote thread in another process
-    ///
-    /// # Safety
-    /// The process handle must be valid and have appropriate access rights
-    pub unsafe fn create_remote_thread(
-        &self,
-        process_handle: *mut std::ffi::c_void,
-        start_routine: *const std::ffi::c_void,
-        parameter: *mut std::ffi::c_void,
-        flags: ThreadCreationFlags,
-    ) -> Result<Arc<ManagedThread>, MapperError> {
-        #[cfg(windows)]
-        {
-            let mut thread_id: u32 = 0;
-            let handle = windows_sys::Win32::System::Threading::CreateRemoteThread(
-                process_handle as windows_sys::Win32::Foundation::HANDLE,
-                ptr::null(),
-                0,
-                Some(std::mem::transmute(start_routine)),
-                parameter,
-                flags as u32,
-                &mut thread_id,
-            );
-
-            if handle.is_null() {
-                return Err(MapperError::ThreadCreationFailed);
-            }
-
-            let thread = Arc::new(ManagedThread::from_raw(
-                handle as *mut std::ffi::c_void,
-                thread_id,
-            )?);
-
-            let mut threads = self.created_threads.lock().unwrap();
-            threads.push(Arc::clone(&thread));
-
-            Ok(thread)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-
-    /// Returns the count of threads created by this factory
-    pub fn thread_count(&self) -> usize {
-        self.created_threads.lock().unwrap().len()
-    }
-
-    /// Waits for all created threads to complete
-    pub fn wait_all(&self, timeout_ms: Option<u32>) -> Result<(), MapperError> {
-        let threads = self.created_threads.lock().unwrap();
-        for thread in threads.iter() {
-            match thread.wait(timeout_ms)? {
-                WaitResult::Timeout => return Err(MapperError::WaitTimeout),
-                _ => continue,
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for ThreadFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Process memory operations helper
-pub struct ProcessMemory {
-    process_handle: SafeHandle,
-}
-
-impl ProcessMemory {
-    /// Creates a new process memory helper for the specified process
-    ///
-    /// # Safety
-    /// The handle must be a valid process handle with appropriate access rights
-    pub unsafe fn from_handle(handle: *mut std::ffi::c_void) -> Result<Self, MapperError> {
-        if handle.is_null() {
-            return Err(MapperError::InvalidHandle);
-        }
-        Ok(Self {
-            process_handle: SafeHandle::from_raw_handle(handle as isize),
-        })
-    }
-
-    /// Allocates memory in the target process
-    pub fn allocate(
-        &self,
-        size: usize,
-        allocation_type: u32,
-        protection: u32,
-    ) -> Result<*mut std::ffi::c_void, MapperError> {
+impl ProcessEnumerator {
+    /// Enumerates all process IDs in the system
+    pub fn enumerate_process_ids() -> Result<Vec<u32>, MapperError> {
         #[cfg(windows)]
         unsafe {
-            let addr = windows_sys::Win32::System::Memory::VirtualAllocEx(
-                self.process_handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                ptr::null(),
-                size,
-                allocation_type,
-                protection,
-            );
-            if addr.is_null() {
-                return Err(MapperError::AllocationFailed);
+            extern "system" {
+                fn EnumProcesses(
+                    lpidProcess: *mut u32,
+                    cb: u32,
+                    lpcbNeeded: *mut u32,
+                ) -> i32;
             }
-            Ok(addr)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
 
-    /// Frees memory in the target process
-    pub fn free(&self, address: *mut std::ffi::c_void) -> Result<(), MapperError> {
-        #[cfg(windows)]
-        unsafe {
-            let result = windows_sys::Win32::System::Memory::VirtualFreeEx(
-                self.process_handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                address,
-                0,
-                windows_sys::Win32::System::Memory::MEM_RELEASE,
+            let mut process_ids = vec![0u32; 1024];
+            let mut bytes_returned: u32 = 0;
+
+            let result = EnumProcesses(
+                process_ids.as_mut_ptr(),
+                (process_ids.len() * std::mem::size_of::<u32>()) as u32,
+                &mut bytes_returned,
             );
-            if result == 0 {
-                return Err(MapperError::FreeFailed);
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
 
-    /// Writes data to the target process memory
-    pub fn write(&self, address: *mut std::ffi::c_void, data: &[u8]) -> Result<usize, MapperError> {
-        #[cfg(windows)]
-        unsafe {
-            let mut bytes_written: usize = 0;
-            let result = windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory(
-                self.process_handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                address,
-                data.as_ptr() as *const std::ffi::c_void,
-                data.len(),
-                &mut bytes_written,
-            );
-            if result == 0 {
-                return Err(MapperError::WriteFailed);
-            }
-            Ok(bytes_written)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-
-    /// Reads data from the target process memory
-    pub fn read(
-        &self,
-        address: *const std::ffi::c_void,
-        buffer: &mut [u8],
-    ) -> Result<usize, MapperError> {
-        #[cfg(windows)]
-        unsafe {
-            let mut bytes_read: usize = 0;
-            let result = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
-                self.process_handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                address,
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                buffer.len(),
-                &mut bytes_read,
-            );
-            if result == 0 {
-                return Err(MapperError::ReadFailed);
-            }
-            Ok(bytes_read)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-
-    /// Changes memory protection in the target process
-    pub fn protect(
-        &self,
-        address: *mut std::ffi::c_void,
-        size: usize,
-        new_protection: u32,
-    ) -> Result<u32, MapperError> {
-        #[cfg(windows)]
-        unsafe {
-            let mut old_protection: u32 = 0;
-            let result = windows_sys::Win32::System::Memory::VirtualProtectEx(
-                self.process_handle.as_raw() as windows_sys::Win32::Foundation::HANDLE,
-                address,
-                size,
-                new_protection,
-                &mut old_protection,
-            );
-            if result == 0 {
-                return Err(MapperError::ProtectFailed);
-            }
-            Ok(old_protection)
-        }
-        #[cfg(not(windows))]
-        Err(MapperError::UnsupportedPlatform)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_library_loader_creation() {
-        let loader = LibraryLoader::new();
-        assert_eq!(loader.loaded_count(), 0);
-    }
-
-    #[test]
-    fn test_thread_factory_creation() {
-        let factory = ThreadFactory::new();
-        assert_eq!(factory.thread_count(), 0);
-    }
-
-    #[test]
-    fn test_thread_priority_values() {
-        assert_eq!(ThreadPriority::Normal as i32, 0);
-        assert_eq!(ThreadPriority::Highest as i32, 2);
-        assert_eq!(ThreadPriority::Lowest as i32, -2);
-    }
-
-    #[test]
-    fn test_thread_creation_flags() {
-        assert_eq!(ThreadCreationFlags::RunImmediately as u32, 0);
-        assert_eq!(ThreadCreationFlags::CreateSuspended as u32, 0x00000004);
-    }
-}
+            if result
