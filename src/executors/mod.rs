@@ -4,7 +4,8 @@
 //! using RAII patterns and idiomatic Rust error handling.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -80,146 +81,241 @@ pub struct ExecutionMetrics {
 /// Trait for executable tasks within the executor
 pub trait Executable: Send + 'static {
     /// Execute the task and return a result
-    fn execute(&mut self) -> Result<(), MapperError>;
+    fn execute(&mut self) -> Result<ExecutionResult, MapperError>;
     
     /// Get the task's priority
     fn priority(&self) -> ExecutionPriority {
         ExecutionPriority::Normal
     }
     
-    /// Called when the task is cancelled
-    fn on_cancel(&mut self) {}
+    /// Get an optional task name for debugging
+    fn name(&self) -> Option<&str> {
+        None
+    }
     
-    /// Get a description of the task
-    fn description(&self) -> &str {
-        "unnamed task"
+    /// Called when the task is about to be cancelled
+    fn on_cancel(&mut self) {}
+}
+
+/// Result of task execution
+#[derive(Debug, Clone)]
+pub struct ExecutionResult {
+    pub status: TaskState,
+    pub duration: Duration,
+    pub output: Option<Vec<u8>>,
+    pub exit_code: i32,
+}
+
+impl ExecutionResult {
+    pub fn success(duration: Duration) -> Self {
+        Self {
+            status: TaskState::Completed,
+            duration,
+            output: None,
+            exit_code: 0,
+        }
+    }
+    
+    pub fn with_output(mut self, output: Vec<u8>) -> Self {
+        self.output = Some(output);
+        self
+    }
+    
+    pub fn with_exit_code(mut self, code: i32) -> Self {
+        self.exit_code = code;
+        self
     }
 }
 
-/// A handle to a submitted task
-#[derive(Debug)]
-pub struct TaskHandle {
-    id: u64,
-    state: Arc<RwLock<TaskState>>,
-    result: Arc<Mutex<Option<Result<(), MapperError>>>>,
-}
+/// Unique identifier for submitted tasks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskHandle(u64);
 
 impl TaskHandle {
     fn new(id: u64) -> Self {
-        Self {
-            id,
-            state: Arc::new(RwLock::new(TaskState::Pending)),
-            result: Arc::new(Mutex::new(None)),
-        }
+        Self(id)
     }
     
-    /// Get the task ID
     pub fn id(&self) -> u64 {
-        self.id
-    }
-    
-    /// Get the current state of the task
-    pub fn state(&self) -> TaskState {
-        *self.state.read().unwrap()
-    }
-    
-    /// Check if the task has completed (successfully or not)
-    pub fn is_finished(&self) -> bool {
-        matches!(
-            self.state(),
-            TaskState::Completed | TaskState::Failed | TaskState::Cancelled
-        )
-    }
-    
-    /// Wait for the task to complete and get the result
-    pub fn wait(&self) -> Result<(), MapperError> {
-        while !self.is_finished() {
-            thread::sleep(Duration::from_millis(10));
-        }
-        
-        self.result
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(Err(MapperError::from_status(NtStatus::from_raw(0xC0000001))))
-    }
-    
-    /// Wait for the task with a timeout
-    pub fn wait_timeout(&self, timeout: Duration) -> Option<Result<(), MapperError>> {
-        let start = Instant::now();
-        while !self.is_finished() {
-            if start.elapsed() >= timeout {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        
-        self.result.lock().unwrap().clone()
+        self.0
     }
 }
 
-/// Internal task wrapper for the executor
+/// Internal task wrapper with metadata
 struct ManagedTask {
-    id: u64,
+    handle: TaskHandle,
     executable: Box<dyn Executable>,
-    state: Arc<RwLock<TaskState>>,
-    result: Arc<Mutex<Option<Result<(), MapperError>>>>,
-    submitted_at: Instant,
+    state: TaskState,
     priority: ExecutionPriority,
+    submitted_at: Instant,
+    started_at: Option<Instant>,
+    retry_count: u32,
+    max_retries: u32,
 }
 
 impl ManagedTask {
     fn new(
-        id: u64,
+        handle: TaskHandle,
         executable: Box<dyn Executable>,
-        state: Arc<RwLock<TaskState>>,
-        result: Arc<Mutex<Option<Result<(), MapperError>>>>,
+        priority: ExecutionPriority,
+        max_retries: u32,
     ) -> Self {
-        let priority = executable.priority();
         Self {
-            id,
+            handle,
             executable,
-            state,
-            result,
-            submitted_at: Instant::now(),
+            state: TaskState::Pending,
             priority,
+            submitted_at: Instant::now(),
+            started_at: None,
+            retry_count: 0,
+            max_retries,
+        }
+    }
+}
+
+/// Observer trait for task lifecycle events
+pub trait TaskObserver: Send + Sync {
+    fn on_task_submitted(&self, handle: TaskHandle);
+    fn on_task_started(&self, handle: TaskHandle);
+    fn on_task_completed(&self, handle: TaskHandle, result: &ExecutionResult);
+    fn on_task_failed(&self, handle: TaskHandle, error: &MapperError);
+    fn on_task_cancelled(&self, handle: TaskHandle);
+}
+
+/// Strategy trait for task scheduling
+pub trait SchedulingStrategy: Send + Sync {
+    fn select_next(&self, tasks: &[&ManagedTask]) -> Option<usize>;
+    fn name(&self) -> &'static str;
+}
+
+/// Priority-based scheduling strategy
+pub struct PriorityScheduler;
+
+impl SchedulingStrategy for PriorityScheduler {
+    fn select_next(&self, tasks: &[&ManagedTask]) -> Option<usize> {
+        tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.state == TaskState::Pending)
+            .max_by_key(|(_, t)| t.priority)
+            .map(|(idx, _)| idx)
+    }
+    
+    fn name(&self) -> &'static str {
+        "PriorityScheduler"
+    }
+}
+
+/// FIFO scheduling strategy
+pub struct FifoScheduler;
+
+impl SchedulingStrategy for FifoScheduler {
+    fn select_next(&self, tasks: &[&ManagedTask]) -> Option<usize> {
+        tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.state == TaskState::Pending)
+            .min_by_key(|(_, t)| t.submitted_at)
+            .map(|(idx, _)| idx)
+    }
+    
+    fn name(&self) -> &'static str {
+        "FifoScheduler"
+    }
+}
+
+/// Thread-safe task result storage
+struct TaskResultStore {
+    results: RwLock<HashMap<TaskHandle, Result<ExecutionResult, MapperError>>>,
+    completion_signals: Mutex<HashMap<TaskHandle, Arc<(Mutex<bool>, Condvar)>>>,
+}
+
+impl TaskResultStore {
+    fn new() -> Self {
+        Self {
+            results: RwLock::new(HashMap::new()),
+            completion_signals: Mutex::new(HashMap::new()),
         }
     }
     
-    fn run(&mut self) -> Result<(), MapperError> {
-        *self.state.write().unwrap() = TaskState::Running;
+    fn register(&self, handle: TaskHandle) -> Arc<(Mutex<bool>, Condvar)> {
+        let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        self.completion_signals
+            .lock()
+            .unwrap()
+            .insert(handle, Arc::clone(&signal));
+        signal
+    }
+    
+    fn store(&self, handle: TaskHandle, result: Result<ExecutionResult, MapperError>) {
+        self.results.write().unwrap().insert(handle, result);
         
-        let result = self.executable.execute();
+        if let Some(signal) = self.completion_signals.lock().unwrap().get(&handle) {
+            let (lock, cvar) = &**signal;
+            let mut completed = lock.lock().unwrap();
+            *completed = true;
+            cvar.notify_all();
+        }
+    }
+    
+    fn get(&self, handle: TaskHandle) -> Option<Result<ExecutionResult, MapperError>> {
+        self.results.read().unwrap().get(&handle).cloned()
+    }
+    
+    fn wait_for(&self, handle: TaskHandle, timeout: Option<Duration>) -> Option<Result<ExecutionResult, MapperError>> {
+        let signal = self.completion_signals.lock().unwrap().get(&handle).cloned()?;
+        let (lock, cvar) = &*signal;
+        let mut completed = lock.lock().unwrap();
         
-        *self.state.write().unwrap() = if result.is_ok() {
-            TaskState::Completed
-        } else {
-            TaskState::Failed
-        };
+        while !*completed {
+            match timeout {
+                Some(dur) => {
+                    let result = cvar.wait_timeout(completed, dur).unwrap();
+                    completed = result.0;
+                    if result.1.timed_out() {
+                        return None;
+                    }
+                }
+                None => {
+                    completed = cvar.wait(completed).unwrap();
+                }
+            }
+        }
         
-        *self.result.lock().unwrap() = Some(result.clone());
-        result
+        self.get(handle)
     }
 }
 
-/// Observer trait for executor events
-pub trait ExecutorObserver: Send + Sync {
-    fn on_task_submitted(&self, task_id: u64);
-    fn on_task_started(&self, task_id: u64);
-    fn on_task_completed(&self, task_id: u64, success: bool);
-    fn on_executor_shutdown(&self);
+/// Worker thread state
+struct WorkerState {
+    id: usize,
+    active: AtomicBool,
+    current_task: Mutex<Option<TaskHandle>>,
 }
 
-/// Thread-safe task executor with priority scheduling
+impl WorkerState {
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            active: AtomicBool::new(true),
+            current_task: Mutex::new(None),
+        }
+    }
+}
+
+/// Main executor for managing task execution
 pub struct TaskExecutor {
     config: ExecutorConfig,
     task_queue: Arc<Mutex<Vec<ManagedTask>>>,
+    result_store: Arc<TaskResultStore>,
     workers: Vec<JoinHandle<()>>,
-    next_task_id: Arc<Mutex<u64>>,
+    worker_states: Vec<Arc<WorkerState>>,
+    shutdown_flag: Arc<AtomicBool>,
+    task_counter: AtomicU64,
     metrics: Arc<RwLock<ExecutionMetrics>>,
-    observers: Arc<RwLock<Vec<Arc<dyn ExecutorObserver>>>>,
-    shutdown_flag: Arc<Mutex<bool>>,
-    active_tasks: Arc<Mutex<HashMap<u64, TaskState>>>,
+    observers: Arc<RwLock<Vec<Arc<dyn TaskObserver>>>>,
+    scheduler: Arc<dyn SchedulingStrategy>,
+    queue_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl TaskExecutor {
@@ -230,105 +326,174 @@ impl TaskExecutor {
     
     /// Create a new executor with custom configuration
     pub fn with_config(config: ExecutorConfig) -> Self {
-        let executor = Self {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let task_queue = Arc::new(Mutex::new(Vec::new()));
+        let result_store = Arc::new(TaskResultStore::new());
+        let metrics = Arc::new(RwLock::new(ExecutionMetrics::default()));
+        let observers: Arc<RwLock<Vec<Arc<dyn TaskObserver>>>> = Arc::new(RwLock::new(Vec::new()));
+        let scheduler: Arc<dyn SchedulingStrategy> = Arc::new(PriorityScheduler);
+        let queue_signal = Arc::new((Mutex::new(false), Condvar::new()));
+        
+        let mut workers = Vec::with_capacity(config.max_threads);
+        let mut worker_states = Vec::with_capacity(config.max_threads);
+        
+        for i in 0..config.max_threads {
+            let state = Arc::new(WorkerState::new(i));
+            worker_states.push(Arc::clone(&state));
+            
+            let worker = Self::spawn_worker(
+                i,
+                Arc::clone(&state),
+                Arc::clone(&task_queue),
+                Arc::clone(&result_store),
+                Arc::clone(&shutdown_flag),
+                Arc::clone(&metrics),
+                Arc::clone(&observers),
+                Arc::clone(&scheduler),
+                Arc::clone(&queue_signal),
+                config.task_timeout,
+            );
+            workers.push(worker);
+        }
+        
+        Self {
             config,
-            task_queue: Arc::new(Mutex::new(Vec::new())),
-            workers: Vec::new(),
-            next_task_id: Arc::new(Mutex::new(1)),
-            metrics: Arc::new(RwLock::new(ExecutionMetrics::default())),
-            observers: Arc::new(RwLock::new(Vec::new())),
-            shutdown_flag: Arc::new(Mutex::new(false)),
-            active_tasks: Arc::new(Mutex::new(HashMap::new())),
-        };
-        executor
+            task_queue,
+            result_store,
+            workers,
+            worker_states,
+            shutdown_flag,
+            task_counter: AtomicU64::new(0),
+            metrics,
+            observers,
+            scheduler,
+            queue_signal,
+        }
     }
     
-    /// Start the executor worker threads
-    pub fn start(&mut self) -> Result<(), MapperError> {
-        if !self.workers.is_empty() {
-            return Err(MapperError::from_status(NtStatus::from_raw(0xC0000001)));
-        }
-        
-        *self.shutdown_flag.lock().unwrap() = false;
-        
-        for worker_id in 0..self.config.max_threads {
-            let queue = Arc::clone(&self.task_queue);
-            let shutdown = Arc::clone(&self.shutdown_flag);
-            let metrics = Arc::clone(&self.metrics);
-            let observers = Arc::clone(&self.observers);
-            let active = Arc::clone(&self.active_tasks);
-            
-            let handle = thread::Builder::new()
-                .name(format!("executor-worker-{}", worker_id))
-                .spawn(move || {
-                    Self::worker_loop(queue, shutdown, metrics, observers, active);
-                })
-                .map_err(|_| MapperError::from_status(NtStatus::from_raw(0xC0000017)))?;
-            
-            self.workers.push(handle);
-        }
-        
-        Ok(())
-    }
-    
-    fn worker_loop(
-        queue: Arc<Mutex<Vec<ManagedTask>>>,
-        shutdown: Arc<Mutex<bool>>,
+    fn spawn_worker(
+        id: usize,
+        state: Arc<WorkerState>,
+        task_queue: Arc<Mutex<Vec<ManagedTask>>>,
+        result_store: Arc<TaskResultStore>,
+        shutdown_flag: Arc<AtomicBool>,
         metrics: Arc<RwLock<ExecutionMetrics>>,
-        observers: Arc<RwLock<Vec<Arc<dyn ExecutorObserver>>>>,
-        active: Arc<Mutex<HashMap<u64, TaskState>>>,
-    ) {
-        loop {
-            if *shutdown.lock().unwrap() {
-                break;
-            }
-            
-            let task = {
-                let mut queue_guard = queue.lock().unwrap();
-                if queue_guard.is_empty() {
-                    None
-                } else {
-                    // Sort by priority (highest first)
-                    queue_guard.sort_by(|a, b| b.priority.cmp(&a.priority));
-                    Some(queue_guard.remove(0))
-                }
-            };
-            
-            match task {
-                Some(mut managed_task) => {
-                    let task_id = managed_task.id;
-                    let start_time = Instant::now();
-                    
-                    // Notify observers
-                    for observer in observers.read().unwrap().iter() {
-                        observer.on_task_started(task_id);
-                    }
-                    
-                    active.lock().unwrap().insert(task_id, TaskState::Running);
-                    
-                    let result = managed_task.run();
-                    let success = result.is_ok();
-                    
-                    active.lock().unwrap().remove(&task_id);
-                    
-                    // Update metrics
-                    {
-                        let mut m = metrics.write().unwrap();
-                        if success {
-                            m.tasks_completed += 1;
-                        } else {
-                            m.tasks_failed += 1;
+        observers: Arc<RwLock<Vec<Arc<dyn TaskObserver>>>>,
+        scheduler: Arc<dyn SchedulingStrategy>,
+        queue_signal: Arc<(Mutex<bool>, Condvar)>,
+        timeout: Option<Duration>,
+    ) -> JoinHandle<()> {
+        thread::Builder::new()
+            .name(format!("executor-worker-{}", id))
+            .spawn(move || {
+                while !shutdown_flag.load(Ordering::Relaxed) {
+                    let task = {
+                        let (lock, cvar) = &*queue_signal;
+                        let mut has_work = lock.lock().unwrap();
+                        
+                        while !*has_work && !shutdown_flag.load(Ordering::Relaxed) {
+                            has_work = cvar.wait_timeout(has_work, Duration::from_millis(100))
+                                .unwrap()
+                                .0;
                         }
-                        m.total_execution_time += start_time.elapsed();
-                    }
+                        
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        
+                        let mut queue = task_queue.lock().unwrap();
+                        let task_refs: Vec<&ManagedTask> = queue.iter().collect();
+                        
+                        if let Some(idx) = scheduler.select_next(&task_refs) {
+                            let mut task = queue.remove(idx);
+                            task.state = TaskState::Running;
+                            task.started_at = Some(Instant::now());
+                            *state.current_task.lock().unwrap() = Some(task.handle);
+                            
+                            if queue.iter().all(|t| t.state != TaskState::Pending) {
+                                *has_work = false;
+                            }
+                            
+                            Some(task)
+                        } else {
+                            *has_work = false;
+                            None
+                        }
+                    };
                     
-                    // Notify observers
-                    for observer in observers.read().unwrap().iter() {
-                        observer.on_task_completed(task_id, success);
+                    if let Some(mut task) = task {
+                        let handle = task.handle;
+                        
+                        for observer in observers.read().unwrap().iter() {
+                            observer.on_task_started(handle);
+                        }
+                        
+                        let start_time = Instant::now();
+                        let result = Self::execute_with_timeout(&mut task, timeout);
+                        let duration = start_time.elapsed();
+                        
+                        match &result {
+                            Ok(exec_result) => {
+                                if metrics.read().unwrap().tasks_completed > 0 {
+                                    let mut m = metrics.write().unwrap();
+                                    m.tasks_completed += 1;
+                                    m.total_execution_time += duration;
+                                } else {
+                                    let mut m = metrics.write().unwrap();
+                                    m.tasks_completed = 1;
+                                    m.total_execution_time = duration;
+                                }
+                                
+                                for observer in observers.read().unwrap().iter() {
+                                    observer.on_task_completed(handle, exec_result);
+                                }
+                            }
+                            Err(e) => {
+                                metrics.write().unwrap().tasks_failed += 1;
+                                
+                                for observer in observers.read().unwrap().iter() {
+                                    observer.on_task_failed(handle, e);
+                                }
+                            }
+                        }
+                        
+                        result_store.store(handle, result);
+                        *state.current_task.lock().unwrap() = None;
                     }
                 }
-                None => {
-                    thread::sleep(Duration::from_millis(10));
+                
+                state.active.store(false, Ordering::Relaxed);
+            })
+            .expect("Failed to spawn worker thread")
+    }
+    
+    fn execute_with_timeout(
+        task: &mut ManagedTask,
+        timeout: Option<Duration>,
+    ) -> Result<ExecutionResult, MapperError> {
+        let start = Instant::now();
+        
+        match task.executable.execute() {
+            Ok(mut result) => {
+                if let Some(max_duration) = timeout {
+                    if result.duration > max_duration {
+                        return Err(MapperError::Timeout {
+                            operation: task.executable.name().unwrap_or("unknown").to_string(),
+                            elapsed: result.duration,
+                        });
+                    }
+                }
+                result.duration = start.elapsed();
+                Ok(result)
+            }
+            Err(e) => {
+                if task.retry_count < task.max_retries {
+                    task.retry_count += 1;
+                    task.state = TaskState::Pending;
+                    Err(e)
+                } else {
+                    task.state = TaskState::Failed;
+                    Err(e)
                 }
             }
         }
@@ -336,69 +501,93 @@ impl TaskExecutor {
     
     /// Submit a task for execution
     pub fn submit<T: Executable>(&self, task: T) -> TaskHandle {
-        let id = {
-            let mut next_id = self.next_task_id.lock().unwrap();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
-        
+        self.submit_with_priority(task, self.config.default_priority)
+    }
+    
+    /// Submit a task with specific priority
+    pub fn submit_with_priority<T: Executable>(
+        &self,
+        task: T,
+        priority: ExecutionPriority,
+    ) -> TaskHandle {
+        let id = self.task_counter.fetch_add(1, Ordering::SeqCst);
         let handle = TaskHandle::new(id);
+        
         let managed = ManagedTask::new(
-            id,
+            handle,
             Box::new(task),
-            Arc::clone(&handle.state),
-            Arc::clone(&handle.result),
+            priority,
+            self.config.retry_count,
         );
         
-        self.task_queue.lock().unwrap().push(managed);
+        self.result_store.register(handle);
         
-        // Update metrics
-        self.metrics.write().unwrap().tasks_submitted += 1;
+        {
+            let mut queue = self.task_queue.lock().unwrap();
+            queue.push(managed);
+        }
         
-        // Notify observers
+        {
+            let (lock, cvar) = &*self.queue_signal;
+            let mut has_work = lock.lock().unwrap();
+            *has_work = true;
+            cvar.notify_one();
+        }
+        
+        if self.config.enable_metrics {
+            self.metrics.write().unwrap().tasks_submitted += 1;
+        }
+        
         for observer in self.observers.read().unwrap().iter() {
-            observer.on_task_submitted(id);
+            observer.on_task_submitted(handle);
         }
         
         handle
     }
     
-    /// Submit a closure as a task
-    pub fn submit_fn<F>(&self, f: F, priority: ExecutionPriority) -> TaskHandle
-    where
-        F: FnOnce() -> Result<(), MapperError> + Send + 'static,
-    {
-        struct ClosureTask<F> {
-            closure: Option<F>,
-            priority: ExecutionPriority,
-        }
-        
-        impl<F> Executable for ClosureTask<F>
-        where
-            F: FnOnce() -> Result<(), MapperError> + Send + 'static,
-        {
-            fn execute(&mut self) -> Result<(), MapperError> {
-                if let Some(f) = self.closure.take() {
-                    f()
-                } else {
-                    Err(MapperError::from_status(NtStatus::from_raw(0xC0000001)))
-                }
-            }
-            
-            fn priority(&self) -> ExecutionPriority {
-                self.priority
-            }
-        }
-        
-        self.submit(ClosureTask {
-            closure: Some(f),
-            priority,
-        })
+    /// Wait for a task to complete
+    pub fn wait(&self, handle: TaskHandle) -> Result<ExecutionResult, MapperError> {
+        self.result_store
+            .wait_for(handle, self.config.task_timeout)
+            .ok_or_else(|| MapperError::Timeout {
+                operation: format!("wait for task {}", handle.id()),
+                elapsed: self.config.task_timeout.unwrap_or(Duration::ZERO),
+            })?
     }
     
-    /// Register an observer for executor events
-    pub fn add_observer(&self, observer: Arc<dyn ExecutorObserver>) {
+    /// Try to get a task result without blocking
+    pub fn try_get(&self, handle: TaskHandle) -> Option<Result<ExecutionResult, MapperError>> {
+        self.result_store.get(handle)
+    }
+    
+    /// Cancel a pending task
+    pub fn cancel(&self, handle: TaskHandle) -> bool {
+        let mut queue = self.task_queue.lock().unwrap();
+        
+        if let Some(pos) = queue.iter().position(|t| t.handle == handle && t.state == TaskState::Pending) {
+            let mut task = queue.remove(pos);
+            task.executable.on_cancel();
+            task.state = TaskState::Cancelled;
+            
+            for observer in self.observers.read().unwrap().iter() {
+                observer.on_task_cancelled(handle);
+            }
+            
+            self.result_store.store(
+                handle,
+                Err(MapperError::OperationCancelled {
+                    operation: "task execution".to_string(),
+                }),
+            );
+            
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Add an observer for task lifecycle events
+    pub fn add_observer(&self, observer: Arc<dyn TaskObserver>) {
         self.observers.write().unwrap().push(observer);
     }
     
@@ -409,41 +598,36 @@ impl TaskExecutor {
     
     /// Get the number of pending tasks
     pub fn pending_count(&self) -> usize {
-        self.task_queue.lock().unwrap().len()
+        self.task_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.state == TaskState::Pending)
+            .count()
     }
     
-    /// Get the number of active tasks
-    pub fn active_count(&self) -> usize {
-        self.active_tasks.lock().unwrap().len()
+    /// Get the number of active workers
+    pub fn active_workers(&self) -> usize {
+        self.worker_states
+            .iter()
+            .filter(|s| s.active.load(Ordering::Relaxed))
+            .count()
     }
     
     /// Shutdown the executor gracefully
-    pub fn shutdown(&mut self) {
-        *self.shutdown_flag.lock().unwrap() = true;
+    pub fn shutdown(self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         
-        // Notify observers
-        for observer in self.observers.read().unwrap().iter() {
-            observer.on_executor_shutdown();
-        }
-        
-        // Wait for workers to finish
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
-    }
-    
-    /// Shutdown immediately, cancelling pending tasks
-    pub fn shutdown_now(&mut self) {
-        // Clear pending tasks
         {
-            let mut queue = self.task_queue.lock().unwrap();
-            for mut task in queue.drain(..) {
-                *task.state.write().unwrap() = TaskState::Cancelled;
-                task.executable.on_cancel();
-            }
+            let (lock, cvar) = &*self.queue_signal;
+            let mut has_work = lock.lock().unwrap();
+            *has_work = true;
+            cvar.notify_all();
         }
         
-        self.shutdown();
+        for worker in self.workers {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -453,109 +637,53 @@ impl Default for TaskExecutor {
     }
 }
 
-impl Drop for TaskExecutor {
-    fn drop(&mut self) {
-        if !self.workers.is_empty() {
-            self.shutdown();
+/// A simple closure-based task implementation
+pub struct ClosureTask<F>
+where
+    F: FnMut() -> Result<ExecutionResult, MapperError> + Send + 'static,
+{
+    func: F,
+    name: Option<String>,
+    priority: ExecutionPriority,
+}
+
+impl<F> ClosureTask<F>
+where
+    F: FnMut() -> Result<ExecutionResult, MapperError> + Send + 'static,
+{
+    pub fn new(func: F) -> Self {
+        Self {
+            func,
+            name: None,
+            priority: ExecutionPriority::Normal,
         }
     }
-}
-
-/// Thread pool for parallel execution of homogeneous tasks
-pub struct ThreadPool {
-    executor: TaskExecutor,
-}
-
-impl ThreadPool {
-    /// Create a new thread pool with the specified number of threads
-    pub fn new(num_threads: usize) -> Result<Self, MapperError> {
-        let config = ExecutorConfig {
-            max_threads: num_threads,
-            ..Default::default()
-        };
-        
-        let mut executor = TaskExecutor::with_config(config);
-        executor.start()?;
-        
-        Ok(Self { executor })
+    
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
     
-    /// Execute a closure on the thread pool
-    pub fn execute<F>(&self, f: F) -> TaskHandle
-    where
-        F: FnOnce() -> Result<(), MapperError> + Send + 'static,
-    {
-        self.executor.submit_fn(f, ExecutionPriority::Normal)
-    }
-    
-    /// Execute multiple closures in parallel and wait for all to complete
-    pub fn execute_all<F, I>(&self, tasks: I) -> Vec<Result<(), MapperError>>
-    where
-        F: FnOnce() -> Result<(), MapperError> + Send + 'static,
-        I: IntoIterator<Item = F>,
-    {
-        let handles: Vec<_> = tasks
-            .into_iter()
-            .map(|f| self.execute(f))
-            .collect();
-        
-        handles.into_iter().map(|h| h.wait()).collect()
-    }
-    
-    /// Get the number of threads in the pool
-    pub fn thread_count(&self) -> usize {
-        self.executor.config.max_threads
+    pub fn with_priority(mut self, priority: ExecutionPriority) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
-/// Scoped thread for RAII-based thread management
-pub struct ScopedThread<T> {
-    handle: Option<JoinHandle<T>>,
-    name: String,
-}
-
-impl<T> ScopedThread<T> {
-    /// Spawn a new scoped thread
-    pub fn spawn<F>(name: &str, f: F) -> Result<Self, MapperError>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let handle = thread::Builder::new()
-            .name(name.to_string())
-            .spawn(f)
-            .map_err(|_| MapperError::from_status(NtStatus::from_raw(0xC0000017)))?;
-        
-        Ok(Self {
-            handle: Some(handle),
-            name: name.to_string(),
-        })
+impl<F> Executable for ClosureTask<F>
+where
+    F: FnMut() -> Result<ExecutionResult, MapperError> + Send + 'static,
+{
+    fn execute(&mut self) -> Result<ExecutionResult, MapperError> {
+        (self.func)()
     }
     
-    /// Get the thread name
-    pub fn name(&self) -> &str {
-        &self.name
+    fn priority(&self) -> ExecutionPriority {
+        self.priority
     }
     
-    /// Check if the thread has finished
-    pub fn is_finished(&self) -> bool {
-        self.handle.as_ref().map_or(true, |h| h.is_finished())
-    }
-    
-    /// Join the thread and get the result
-    pub fn join(mut self) -> Result<T, MapperError> {
-        self.handle
-            .take()
-            .ok_or_else(|| MapperError::from_status(NtStatus::from_raw(0xC0000001)))?
-            .join()
-            .map_err(|_| MapperError::from_status(NtStatus::from_raw(0xC0000001)))
-    }
-}
-
-impl<T> Drop for ScopedThread<T> {
-    fn drop(&mut self) {
-        // Thread will be detached if not joined
-        // This is intentional - we don't want to block in drop
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
@@ -567,6 +695,7 @@ pub struct ProcessInfo {
     pub parent_pid: Option<ProcessId>,
     pub thread_count: u32,
     pub priority: ExecutionPriority,
+    pub start_time: Option<Instant>,
 }
 
 /// Thread information structure
@@ -574,112 +703,70 @@ pub struct ProcessInfo {
 pub struct ThreadInfo {
     pub tid: ThreadId,
     pub owner_pid: ProcessId,
+    pub state: TaskState,
     pub priority: ExecutionPriority,
-    pub state: ThreadState,
+    pub cpu_time: Duration,
 }
 
-/// Thread execution state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadState {
-    Ready,
-    Running,
-    Waiting,
-    Suspended,
-    Terminated,
-}
-
-/// Strategy trait for process enumeration
-pub trait ProcessEnumerationStrategy: Send + Sync {
-    fn enumerate(&self) -> Result<Vec<ProcessInfo>, MapperError>;
-    fn get_process(&self, pid: ProcessId) -> Result<Option<ProcessInfo>, MapperError>;
-}
-
-/// Default process enumeration using system calls
-pub struct SystemProcessEnumerator;
-
-impl ProcessEnumerationStrategy for SystemProcessEnumerator {
-    fn enumerate(&self) -> Result<Vec<ProcessInfo>, MapperError> {
-        // TODO: Implement actual system enumeration
-        // This would use platform-specific APIs
-        Ok(Vec::new())
-    }
-    
-    fn get_process(&self, _pid: ProcessId) -> Result<Option<ProcessInfo>, MapperError> {
-        // TODO: Implement actual process lookup
-        Ok(None)
-    }
-}
-
-/// Process manager with pluggable enumeration strategy
+/// Process manager for system process operations
 pub struct ProcessManager {
-    strategy: Box<dyn ProcessEnumerationStrategy>,
-    cache: RwLock<HashMap<ProcessId, ProcessInfo>>,
-    cache_ttl: Duration,
-    last_refresh: Mutex<Instant>,
+    tracked_processes: RwLock<HashMap<ProcessId, ProcessInfo>>,
+    process_observers: RwLock<Vec<Arc<dyn ProcessObserver>>>,
+}
+
+/// Observer trait for process lifecycle events
+pub trait ProcessObserver: Send + Sync {
+    fn on_process_created(&self, info: &ProcessInfo);
+    fn on_process_terminated(&self, pid: ProcessId, exit_code: i32);
+    fn on_process_state_changed(&self, pid: ProcessId, new_state: TaskState);
 }
 
 impl ProcessManager {
-    /// Create a new process manager with the default strategy
     pub fn new() -> Self {
-        Self::with_strategy(Box::new(SystemProcessEnumerator))
-    }
-    
-    /// Create a new process manager with a custom strategy
-    pub fn with_strategy(strategy: Box<dyn ProcessEnumerationStrategy>) -> Self {
         Self {
-            strategy,
-            cache: RwLock::new(HashMap::new()),
-            cache_ttl: Duration::from_secs(5),
-            last_refresh: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            tracked_processes: RwLock::new(HashMap::new()),
+            process_observers: RwLock::new(Vec::new()),
         }
     }
     
-    /// Refresh the process cache
-    pub fn refresh(&self) -> Result<(), MapperError> {
-        let processes = self.strategy.enumerate()?;
+    /// Track a process by its ID
+    pub fn track(&self, info: ProcessInfo) {
+        let pid = info.pid;
         
-        let mut cache = self.cache.write().unwrap();
-        cache.clear();
-        for proc in processes {
-            cache.insert(proc.pid, proc);
+        for observer in self.process_observers.read().unwrap().iter() {
+            observer.on_process_created(&info);
         }
         
-        *self.last_refresh.lock().unwrap() = Instant::now();
-        Ok(())
+        self.tracked_processes.write().unwrap().insert(pid, info);
     }
     
-    /// Get all processes (refreshes cache if stale)
-    pub fn get_all(&self) -> Result<Vec<ProcessInfo>, MapperError> {
-        self.ensure_fresh()?;
-        Ok(self.cache.read().unwrap().values().cloned().collect())
+    /// Stop tracking a process
+    pub fn untrack(&self, pid: ProcessId) -> Option<ProcessInfo> {
+        self.tracked_processes.write().unwrap().remove(&pid)
     }
     
-    /// Get a specific process by PID
-    pub fn get(&self, pid: ProcessId) -> Result<Option<ProcessInfo>, MapperError> {
-        self.ensure_fresh()?;
-        Ok(self.cache.read().unwrap().get(&pid).cloned())
+    /// Get information about a tracked process
+    pub fn get_info(&self, pid: ProcessId) -> Option<ProcessInfo> {
+        self.tracked_processes.read().unwrap().get(&pid).cloned()
     }
     
-    /// Find processes by name
-    pub fn find_by_name(&self, name: &str) -> Result<Vec<ProcessInfo>, MapperError> {
-        self.ensure_fresh()?;
-        let name_lower = name.to_lowercase();
-        Ok(self
-            .cache
-            .read()
-            .unwrap()
-            .values()
-            .filter(|p| p.name.to_lowercase().contains(&name_lower))
-            .cloned()
-            .collect())
+    /// List all tracked processes
+    pub fn list_tracked(&self) -> Vec<ProcessInfo> {
+        self.tracked_processes.read().unwrap().values().cloned().collect()
     }
     
-    fn ensure_fresh(&self) -> Result<(), MapperError> {
-        let last = *self.last_refresh.lock().unwrap();
-        if last.elapsed() > self.cache_ttl {
-            self.refresh()?;
+    /// Add a process observer
+    pub fn add_observer(&self, observer: Arc<dyn ProcessObserver>) {
+        self.process_observers.write().unwrap().push(observer);
+    }
+    
+    /// Notify observers of process termination
+    pub fn notify_terminated(&self, pid: ProcessId, exit_code: i32) {
+        for observer in self.process_observers.read().unwrap().iter() {
+            observer.on_process_terminated(pid, exit_code);
         }
-        Ok(())
+        
+        self.untrack(pid);
     }
 }
 
@@ -689,13 +776,93 @@ impl Default for ProcessManager {
     }
 }
 
-// Provide a way to get CPU count without external dependency
-mod num_cpus {
-    pub fn get() -> usize {
-        // Simple fallback - in production would use actual system call
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
+/// Factory for creating executors with different configurations
+pub struct ExecutorFactory;
+
+impl ExecutorFactory {
+    /// Create a single-threaded executor
+    pub fn single_threaded() -> TaskExecutor {
+        TaskExecutor::with_config(ExecutorConfig {
+            max_threads: 1,
+            ..Default::default()
+        })
+    }
+    
+    /// Create a high-performance executor
+    pub fn high_performance() -> TaskExecutor {
+        let cpu_count = num_cpus::get();
+        TaskExecutor::with_config(ExecutorConfig {
+            max_threads: cpu_count * 2,
+            default_priority: ExecutionPriority::High,
+            task_timeout: Some(Duration::from_secs(60)),
+            enable_metrics: true,
+            retry_count: 1,
+        })
+    }
+    
+    /// Create an executor optimized for I/O-bound tasks
+    pub fn io_optimized() -> TaskExecutor {
+        let cpu_count = num_cpus::get();
+        TaskExecutor::with_config(ExecutorConfig {
+            max_threads: cpu_count * 4,
+            default_priority: ExecutionPriority::Normal,
+            task_timeout: Some(Duration::from_secs(600)),
+            enable_metrics: true,
+            retry_count: 5,
+        })
+    }
+    
+    /// Create an executor with custom thread count
+    pub fn with_threads(count: usize) -> TaskExecutor {
+        TaskExecutor::with_config(ExecutorConfig {
+            max_threads: count.max(1),
+            ..Default::default()
+        })
+    }
+}
+
+/// Scoped executor that ensures all tasks complete before dropping
+pub struct ScopedExecutor {
+    executor: TaskExecutor,
+    pending_handles: Mutex<Vec<TaskHandle>>,
+}
+
+impl ScopedExecutor {
+    pub fn new() -> Self {
+        Self {
+            executor: TaskExecutor::new(),
+            pending_handles: Mutex::new(Vec::new()),
+        }
+    }
+    
+    pub fn with_config(config: ExecutorConfig) -> Self {
+        Self {
+            executor: TaskExecutor::with_config(config),
+            pending_handles: Mutex::new(Vec::new()),
+        }
+    }
+    
+    pub fn submit<T: Executable>(&self, task: T) -> TaskHandle {
+        let handle = self.executor.submit(task);
+        self.pending_handles.lock().unwrap().push(handle);
+        handle
+    }
+    
+    pub fn wait_all(&self) -> Vec<Result<ExecutionResult, MapperError>> {
+        let handles: Vec<TaskHandle> = self.pending_handles.lock().unwrap().drain(..).collect();
+        handles.into_iter().map(|h| self.executor.wait(h)).collect()
+    }
+}
+
+impl Default for ScopedExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ScopedExecutor {
+    fn drop(&mut self) {
+        let _ = self.wait_all();
     }
 }
 
@@ -703,27 +870,17 @@ mod num_cpus {
 mod tests {
     use super::*;
     
-    struct TestTask {
-        value: i32,
-    }
-    
-    impl Executable for TestTask {
-        fn execute(&mut self) -> Result<(), MapperError> {
-            self.value *= 2;
-            Ok(())
-        }
-        
-        fn description(&self) -> &str {
-            "test task"
-        }
+    #[test]
+    fn test_task_handle_creation() {
+        let handle = TaskHandle::new(42);
+        assert_eq!(handle.id(), 42);
     }
     
     #[test]
-    fn test_task_handle_creation() {
-        let handle = TaskHandle::new(1);
-        assert_eq!(handle.id(), 1);
-        assert_eq!(handle.state(), TaskState::Pending);
-        assert!(!handle.is_finished());
+    fn test_execution_priority_ordering() {
+        assert!(ExecutionPriority::Critical > ExecutionPriority::High);
+        assert!(ExecutionPriority::High > ExecutionPriority::Normal);
+        assert!(ExecutionPriority::Normal > ExecutionPriority::Low);
     }
     
     #[test]
@@ -735,9 +892,13 @@ mod tests {
     }
     
     #[test]
-    fn test_execution_priority_ordering() {
-        assert!(ExecutionPriority::Critical > ExecutionPriority::High);
-        assert!(ExecutionPriority::High > ExecutionPriority::Normal);
-        assert!(ExecutionPriority::Normal > ExecutionPriority::Low);
+    fn test_execution_result_builder() {
+        let result = ExecutionResult::success(Duration::from_secs(1))
+            .with_output(vec![1, 2, 3])
+            .with_exit_code(0);
+        
+        assert_eq!(result.status, TaskState::Completed);
+        assert_eq!(result.output, Some(vec![1, 2, 3]));
+        assert_eq!(result.exit_code, 0);
     }
 }
