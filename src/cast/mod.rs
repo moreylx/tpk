@@ -6,6 +6,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::mem;
 use std::slice;
+use std::ffi::CStr;
 
 use crate::error::MapperError;
 
@@ -35,6 +36,21 @@ pub const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
 
 /// Section characteristic: writable
 pub const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
+
+/// Section contains code
+pub const IMAGE_SCN_CNT_CODE: u32 = 0x00000020;
+
+/// Section contains initialized data
+pub const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040;
+
+/// Section contains uninitialized data
+pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080;
+
+/// Maximum number of data directories
+pub const IMAGE_NUMBEROF_DIRECTORY_ENTRIES: usize = 16;
+
+/// Section name length
+pub const IMAGE_SIZEOF_SHORT_NAME: usize = 8;
 
 /// Data directory indices
 #[repr(usize)]
@@ -83,6 +99,18 @@ pub struct DosHeader {
     pub e_lfanew: i32,
 }
 
+impl DosHeader {
+    /// Validates the DOS header magic signature
+    pub fn is_valid(&self) -> bool {
+        self.e_magic == DOS_SIGNATURE
+    }
+
+    /// Returns the offset to the PE header
+    pub fn pe_offset(&self) -> u32 {
+        self.e_lfanew as u32
+    }
+}
+
 /// COFF file header
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -96,6 +124,18 @@ pub struct FileHeader {
     pub characteristics: u16,
 }
 
+impl FileHeader {
+    /// Check if this is a 64-bit executable
+    pub fn is_64bit(&self) -> bool {
+        self.machine == IMAGE_FILE_MACHINE_AMD64
+    }
+
+    /// Check if this is a 32-bit executable
+    pub fn is_32bit(&self) -> bool {
+        self.machine == IMAGE_FILE_MACHINE_I386
+    }
+}
+
 /// Data directory entry
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,7 +144,14 @@ pub struct DataDirectory {
     pub size: u32,
 }
 
-/// Optional header for PE32
+impl DataDirectory {
+    /// Check if this directory entry is present
+    pub fn is_present(&self) -> bool {
+        self.virtual_address != 0 && self.size != 0
+    }
+}
+
+/// Optional header for PE32 (32-bit)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct OptionalHeader32 {
@@ -138,10 +185,10 @@ pub struct OptionalHeader32 {
     pub size_of_heap_commit: u32,
     pub loader_flags: u32,
     pub number_of_rva_and_sizes: u32,
-    pub data_directory: [DataDirectory; 16],
+    pub data_directory: [DataDirectory; IMAGE_NUMBEROF_DIRECTORY_ENTRIES],
 }
 
-/// Optional header for PE32+
+/// Optional header for PE32+ (64-bit)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct OptionalHeader64 {
@@ -174,14 +221,14 @@ pub struct OptionalHeader64 {
     pub size_of_heap_commit: u64,
     pub loader_flags: u32,
     pub number_of_rva_and_sizes: u32,
-    pub data_directory: [DataDirectory; 16],
+    pub data_directory: [DataDirectory; IMAGE_NUMBEROF_DIRECTORY_ENTRIES],
 }
 
 /// Section header
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct SectionHeader {
-    pub name: [u8; 8],
+    pub name: [u8; IMAGE_SIZEOF_SHORT_NAME],
     pub virtual_size: u32,
     pub virtual_address: u32,
     pub size_of_raw_data: u32,
@@ -197,8 +244,8 @@ impl SectionHeader {
     /// Get the section name as a string
     pub fn name_str(&self) -> &str {
         let name_bytes = &self.name;
-        let len = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
-        std::str::from_utf8(&name_bytes[..len]).unwrap_or("")
+        let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(IMAGE_SIZEOF_SHORT_NAME);
+        std::str::from_utf8(&name_bytes[..end]).unwrap_or("")
     }
 
     /// Check if section is executable
@@ -215,20 +262,14 @@ impl SectionHeader {
     pub fn is_writable(&self) -> bool {
         self.characteristics & IMAGE_SCN_MEM_WRITE != 0
     }
+
+    /// Check if section contains code
+    pub fn contains_code(&self) -> bool {
+        self.characteristics & IMAGE_SCN_CNT_CODE != 0
+    }
 }
 
-/// Import directory entry
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct ImportDescriptor {
-    pub original_first_thunk: u32,
-    pub time_date_stamp: u32,
-    pub forwarder_chain: u32,
-    pub name: u32,
-    pub first_thunk: u32,
-}
-
-/// Export directory
+/// Export directory table
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct ExportDirectory {
@@ -243,6 +284,24 @@ pub struct ExportDirectory {
     pub address_of_functions: u32,
     pub address_of_names: u32,
     pub address_of_name_ordinals: u32,
+}
+
+/// Import descriptor
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct ImportDescriptor {
+    pub original_first_thunk: u32,
+    pub time_date_stamp: u32,
+    pub forwarder_chain: u32,
+    pub name: u32,
+    pub first_thunk: u32,
+}
+
+impl ImportDescriptor {
+    /// Check if this is the null terminator
+    pub fn is_null(&self) -> bool {
+        self.original_first_thunk == 0 && self.name == 0 && self.first_thunk == 0
+    }
 }
 
 /// Base relocation block header
@@ -276,257 +335,291 @@ impl TryFrom<u16> for RelocationType {
             3 => Ok(RelocationType::HighLow),
             4 => Ok(RelocationType::HighAdj),
             10 => Ok(RelocationType::Dir64),
-            _ => Err(MapperError::InvalidData(format!(
-                "Unknown relocation type: {}",
-                value
-            ))),
+            _ => Err(MapperError::InvalidFormat(format!("Unknown relocation type: {}", value))),
         }
     }
 }
 
-/// PE architecture type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeArchitecture {
-    X86,
-    X64,
+/// Parsed export entry
+#[derive(Debug, Clone)]
+pub struct ExportEntry {
+    pub ordinal: u16,
+    pub name: Option<String>,
+    pub rva: u32,
+    pub forwarded_to: Option<String>,
 }
 
-/// Parsed PE image representation
-pub struct PeImage {
-    data: Vec<u8>,
-    architecture: PeArchitecture,
-    dos_header_offset: usize,
-    nt_headers_offset: usize,
-    file_header_offset: usize,
-    optional_header_offset: usize,
-    sections_offset: usize,
-    number_of_sections: u16,
+/// Parsed import entry
+#[derive(Debug, Clone)]
+pub struct ImportEntry {
+    pub dll_name: String,
+    pub functions: Vec<ImportFunction>,
 }
 
-impl PeImage {
-    /// Parse a PE image from raw bytes
-    pub fn parse(data: Vec<u8>) -> Result<Self, MapperError> {
-        if data.len() < mem::size_of::<DosHeader>() {
-            return Err(MapperError::InvalidData(
-                "Data too small for DOS header".into(),
-            ));
-        }
+/// Imported function
+#[derive(Debug, Clone)]
+pub struct ImportFunction {
+    pub name: Option<String>,
+    pub ordinal: Option<u16>,
+    pub hint: u16,
+}
 
-        // Validate DOS header
-        let dos_header = unsafe { &*(data.as_ptr() as *const DosHeader) };
-        if dos_header.e_magic != DOS_SIGNATURE {
-            return Err(MapperError::InvalidData("Invalid DOS signature".into()));
-        }
+/// Relocation entry
+#[derive(Debug, Clone, Copy)]
+pub struct RelocationEntry {
+    pub rva: u32,
+    pub reloc_type: RelocationType,
+}
 
-        let nt_headers_offset = dos_header.e_lfanew as usize;
-        if nt_headers_offset + 4 > data.len() {
-            return Err(MapperError::InvalidData(
-                "Invalid PE header offset".into(),
-            ));
-        }
+/// Architecture-independent optional header representation
+#[derive(Debug, Clone)]
+pub enum OptionalHeader {
+    Pe32(OptionalHeader32),
+    Pe64(OptionalHeader64),
+}
 
-        // Validate PE signature
-        let pe_signature = unsafe { *(data.as_ptr().add(nt_headers_offset) as *const u32) };
-        if pe_signature != PE_SIGNATURE {
-            return Err(MapperError::InvalidData("Invalid PE signature".into()));
-        }
-
-        let file_header_offset = nt_headers_offset + 4;
-        if file_header_offset + mem::size_of::<FileHeader>() > data.len() {
-            return Err(MapperError::InvalidData(
-                "Data too small for file header".into(),
-            ));
-        }
-
-        let file_header = unsafe { &*(data.as_ptr().add(file_header_offset) as *const FileHeader) };
-        let optional_header_offset = file_header_offset + mem::size_of::<FileHeader>();
-
-        // Determine architecture from optional header magic
-        if optional_header_offset + 2 > data.len() {
-            return Err(MapperError::InvalidData(
-                "Data too small for optional header".into(),
-            ));
-        }
-
-        let magic = unsafe { *(data.as_ptr().add(optional_header_offset) as *const u16) };
-        let architecture = match magic {
-            PE32_MAGIC => PeArchitecture::X86,
-            PE64_MAGIC => PeArchitecture::X64,
-            _ => {
-                return Err(MapperError::InvalidData(format!(
-                    "Unknown PE magic: 0x{:04X}",
-                    magic
-                )))
-            }
-        };
-
-        let optional_header_size = file_header.size_of_optional_header as usize;
-        let sections_offset = optional_header_offset + optional_header_size;
-
-        if sections_offset > data.len() {
-            return Err(MapperError::InvalidData(
-                "Invalid sections offset".into(),
-            ));
-        }
-
-        Ok(Self {
-            data,
-            architecture,
-            dos_header_offset: 0,
-            nt_headers_offset,
-            file_header_offset,
-            optional_header_offset,
-            sections_offset,
-            number_of_sections: file_header.number_of_sections,
-        })
-    }
-
-    /// Parse a PE image from a reader
-    pub fn from_reader<R: Read>(mut reader: R) -> Result<Self, MapperError> {
-        let mut data = Vec::new();
-        reader
-            .read_to_end(&mut data)
-            .map_err(|e| MapperError::IoError(e.to_string()))?;
-        Self::parse(data)
-    }
-
-    /// Get the PE architecture
-    pub fn architecture(&self) -> PeArchitecture {
-        self.architecture
-    }
-
-    /// Check if this is a 64-bit PE
-    pub fn is_64bit(&self) -> bool {
-        self.architecture == PeArchitecture::X64
-    }
-
-    /// Get the DOS header
-    pub fn dos_header(&self) -> &DosHeader {
-        unsafe { &*(self.data.as_ptr().add(self.dos_header_offset) as *const DosHeader) }
-    }
-
-    /// Get the file header
-    pub fn file_header(&self) -> &FileHeader {
-        unsafe { &*(self.data.as_ptr().add(self.file_header_offset) as *const FileHeader) }
-    }
-
-    /// Get the optional header for PE32
-    pub fn optional_header_32(&self) -> Option<&OptionalHeader32> {
-        if self.architecture == PeArchitecture::X86 {
-            Some(unsafe {
-                &*(self.data.as_ptr().add(self.optional_header_offset) as *const OptionalHeader32)
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Get the optional header for PE64
-    pub fn optional_header_64(&self) -> Option<&OptionalHeader64> {
-        if self.architecture == PeArchitecture::X64 {
-            Some(unsafe {
-                &*(self.data.as_ptr().add(self.optional_header_offset) as *const OptionalHeader64)
-            })
-        } else {
-            None
-        }
-    }
-
+impl OptionalHeader {
     /// Get the image base address
     pub fn image_base(&self) -> u64 {
-        match self.architecture {
-            PeArchitecture::X86 => self.optional_header_32().unwrap().image_base as u64,
-            PeArchitecture::X64 => self.optional_header_64().unwrap().image_base,
+        match self {
+            OptionalHeader::Pe32(h) => h.image_base as u64,
+            OptionalHeader::Pe64(h) => h.image_base,
         }
     }
 
     /// Get the entry point RVA
-    pub fn entry_point_rva(&self) -> u32 {
-        match self.architecture {
-            PeArchitecture::X86 => self.optional_header_32().unwrap().address_of_entry_point,
-            PeArchitecture::X64 => self.optional_header_64().unwrap().address_of_entry_point,
+    pub fn entry_point(&self) -> u32 {
+        match self {
+            OptionalHeader::Pe32(h) => h.address_of_entry_point,
+            OptionalHeader::Pe64(h) => h.address_of_entry_point,
         }
     }
 
     /// Get the size of the image when loaded
     pub fn size_of_image(&self) -> u32 {
-        match self.architecture {
-            PeArchitecture::X86 => self.optional_header_32().unwrap().size_of_image,
-            PeArchitecture::X64 => self.optional_header_64().unwrap().size_of_image,
+        match self {
+            OptionalHeader::Pe32(h) => h.size_of_image,
+            OptionalHeader::Pe64(h) => h.size_of_image,
         }
     }
 
-    /// Get the section alignment
+    /// Get the size of headers
+    pub fn size_of_headers(&self) -> u32 {
+        match self {
+            OptionalHeader::Pe32(h) => h.size_of_headers,
+            OptionalHeader::Pe64(h) => h.size_of_headers,
+        }
+    }
+
+    /// Get section alignment
     pub fn section_alignment(&self) -> u32 {
-        match self.architecture {
-            PeArchitecture::X86 => self.optional_header_32().unwrap().section_alignment,
-            PeArchitecture::X64 => self.optional_header_64().unwrap().section_alignment,
+        match self {
+            OptionalHeader::Pe32(h) => h.section_alignment,
+            OptionalHeader::Pe64(h) => h.section_alignment,
         }
     }
 
-    /// Get the file alignment
+    /// Get file alignment
     pub fn file_alignment(&self) -> u32 {
-        match self.architecture {
-            PeArchitecture::X86 => self.optional_header_32().unwrap().file_alignment,
-            PeArchitecture::X64 => self.optional_header_64().unwrap().file_alignment,
+        match self {
+            OptionalHeader::Pe32(h) => h.file_alignment,
+            OptionalHeader::Pe64(h) => h.file_alignment,
         }
     }
 
     /// Get a data directory entry
-    pub fn data_directory(&self, index: DataDirectoryIndex) -> DataDirectory {
+    pub fn data_directory(&self, index: DataDirectoryIndex) -> Option<&DataDirectory> {
         let idx = index as usize;
-        match self.architecture {
-            PeArchitecture::X86 => {
-                let opt = self.optional_header_32().unwrap();
-                if idx < opt.number_of_rva_and_sizes as usize {
-                    opt.data_directory[idx]
-                } else {
-                    DataDirectory::default()
-                }
+        match self {
+            OptionalHeader::Pe32(h) if idx < h.number_of_rva_and_sizes as usize => {
+                Some(&h.data_directory[idx])
             }
-            PeArchitecture::X64 => {
-                let opt = self.optional_header_64().unwrap();
-                if idx < opt.number_of_rva_and_sizes as usize {
-                    opt.data_directory[idx]
-                } else {
-                    DataDirectory::default()
-                }
+            OptionalHeader::Pe64(h) if idx < h.number_of_rva_and_sizes as usize => {
+                Some(&h.data_directory[idx])
             }
+            _ => None,
         }
+    }
+
+    /// Check if this is a 64-bit PE
+    pub fn is_64bit(&self) -> bool {
+        matches!(self, OptionalHeader::Pe64(_))
+    }
+}
+
+/// Complete parsed PE file representation
+#[derive(Debug)]
+pub struct PeFile {
+    data: Vec<u8>,
+    dos_header: DosHeader,
+    file_header: FileHeader,
+    optional_header: OptionalHeader,
+    sections: Vec<SectionHeader>,
+}
+
+impl PeFile {
+    /// Parse a PE file from a byte slice
+    pub fn parse(data: &[u8]) -> Result<Self, MapperError> {
+        if data.len() < mem::size_of::<DosHeader>() {
+            return Err(MapperError::InvalidFormat("File too small for DOS header".into()));
+        }
+
+        // Parse DOS header
+        let dos_header: DosHeader = unsafe {
+            std::ptr::read_unaligned(data.as_ptr() as *const DosHeader)
+        };
+
+        if !dos_header.is_valid() {
+            return Err(MapperError::InvalidFormat("Invalid DOS signature".into()));
+        }
+
+        let pe_offset = dos_header.pe_offset() as usize;
+        
+        // Validate PE offset
+        if pe_offset + 4 > data.len() {
+            return Err(MapperError::InvalidFormat("PE offset out of bounds".into()));
+        }
+
+        // Check PE signature
+        let pe_sig = u32::from_le_bytes([
+            data[pe_offset],
+            data[pe_offset + 1],
+            data[pe_offset + 2],
+            data[pe_offset + 3],
+        ]);
+
+        if pe_sig != PE_SIGNATURE {
+            return Err(MapperError::InvalidFormat("Invalid PE signature".into()));
+        }
+
+        // Parse file header
+        let file_header_offset = pe_offset + 4;
+        if file_header_offset + mem::size_of::<FileHeader>() > data.len() {
+            return Err(MapperError::InvalidFormat("File too small for file header".into()));
+        }
+
+        let file_header: FileHeader = unsafe {
+            std::ptr::read_unaligned(data[file_header_offset..].as_ptr() as *const FileHeader)
+        };
+
+        // Parse optional header
+        let optional_header_offset = file_header_offset + mem::size_of::<FileHeader>();
+        
+        if optional_header_offset + 2 > data.len() {
+            return Err(MapperError::InvalidFormat("File too small for optional header magic".into()));
+        }
+
+        let magic = u16::from_le_bytes([data[optional_header_offset], data[optional_header_offset + 1]]);
+
+        let optional_header = match magic {
+            PE32_MAGIC => {
+                if optional_header_offset + mem::size_of::<OptionalHeader32>() > data.len() {
+                    return Err(MapperError::InvalidFormat("File too small for PE32 optional header".into()));
+                }
+                let header: OptionalHeader32 = unsafe {
+                    std::ptr::read_unaligned(data[optional_header_offset..].as_ptr() as *const OptionalHeader32)
+                };
+                OptionalHeader::Pe32(header)
+            }
+            PE64_MAGIC => {
+                if optional_header_offset + mem::size_of::<OptionalHeader64>() > data.len() {
+                    return Err(MapperError::InvalidFormat("File too small for PE64 optional header".into()));
+                }
+                let header: OptionalHeader64 = unsafe {
+                    std::ptr::read_unaligned(data[optional_header_offset..].as_ptr() as *const OptionalHeader64)
+                };
+                OptionalHeader::Pe64(header)
+            }
+            _ => return Err(MapperError::InvalidFormat(format!("Unknown PE magic: 0x{:04X}", magic))),
+        };
+
+        // Parse section headers
+        let sections_offset = optional_header_offset + file_header.size_of_optional_header as usize;
+        let num_sections = file_header.number_of_sections as usize;
+        
+        let sections_size = num_sections * mem::size_of::<SectionHeader>();
+        if sections_offset + sections_size > data.len() {
+            return Err(MapperError::InvalidFormat("File too small for section headers".into()));
+        }
+
+        let mut sections = Vec::with_capacity(num_sections);
+        for i in 0..num_sections {
+            let section_offset = sections_offset + i * mem::size_of::<SectionHeader>();
+            let section: SectionHeader = unsafe {
+                std::ptr::read_unaligned(data[section_offset..].as_ptr() as *const SectionHeader)
+            };
+            sections.push(section);
+        }
+
+        Ok(PeFile {
+            data: data.to_vec(),
+            dos_header,
+            file_header,
+            optional_header,
+            sections,
+        })
+    }
+
+    /// Parse from a reader
+    pub fn parse_from_reader<R: Read>(reader: &mut R) -> Result<Self, MapperError> {
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)
+            .map_err(|e| MapperError::IoError(e.to_string()))?;
+        Self::parse(&data)
+    }
+
+    /// Get the DOS header
+    pub fn dos_header(&self) -> &DosHeader {
+        &self.dos_header
+    }
+
+    /// Get the file header
+    pub fn file_header(&self) -> &FileHeader {
+        &self.file_header
+    }
+
+    /// Get the optional header
+    pub fn optional_header(&self) -> &OptionalHeader {
+        &self.optional_header
     }
 
     /// Get all section headers
     pub fn sections(&self) -> &[SectionHeader] {
-        let count = self.number_of_sections as usize;
-        unsafe {
-            slice::from_raw_parts(
-                self.data.as_ptr().add(self.sections_offset) as *const SectionHeader,
-                count,
-            )
-        }
+        &self.sections
     }
 
     /// Find a section by name
     pub fn find_section(&self, name: &str) -> Option<&SectionHeader> {
-        self.sections().iter().find(|s| s.name_str() == name)
+        self.sections.iter().find(|s| s.name_str() == name)
+    }
+
+    /// Get the raw file data
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Convert RVA to file offset
     pub fn rva_to_offset(&self, rva: u32) -> Option<usize> {
-        for section in self.sections() {
+        for section in &self.sections {
             let section_start = section.virtual_address;
             let section_end = section_start + section.virtual_size;
-
+            
             if rva >= section_start && rva < section_end {
                 let offset_in_section = rva - section_start;
                 return Some((section.pointer_to_raw_data + offset_in_section) as usize);
             }
         }
+        
+        // RVA might be in headers
+        if rva < self.optional_header.size_of_headers() {
+            return Some(rva as usize);
+        }
+        
         None
     }
 
-    /// Get raw data at an RVA
-    pub fn data_at_rva(&self, rva: u32, size: usize) -> Option<&[u8]> {
+    /// Read bytes at an RVA
+    pub fn read_at_rva(&self, rva: u32, size: usize) -> Option<&[u8]> {
         let offset = self.rva_to_offset(rva)?;
         if offset + size <= self.data.len() {
             Some(&self.data[offset..offset + size])
@@ -536,320 +629,201 @@ impl PeImage {
     }
 
     /// Read a null-terminated string at an RVA
-    pub fn string_at_rva(&self, rva: u32) -> Option<&str> {
+    pub fn read_string_at_rva(&self, rva: u32) -> Option<String> {
         let offset = self.rva_to_offset(rva)?;
-        let remaining = &self.data[offset..];
-        let len = remaining.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&remaining[..len]).ok()
-    }
-
-    /// Get the raw PE data
-    pub fn raw_data(&self) -> &[u8] {
-        &self.data
+        if offset >= self.data.len() {
+            return None;
+        }
+        
+        let bytes = &self.data[offset..];
+        let end = bytes.iter().position(|&b| b == 0)?;
+        String::from_utf8(bytes[..end].to_vec()).ok()
     }
 
     /// Get section data by section header
     pub fn section_data(&self, section: &SectionHeader) -> Option<&[u8]> {
         let start = section.pointer_to_raw_data as usize;
         let size = section.size_of_raw_data as usize;
+        
         if start + size <= self.data.len() {
             Some(&self.data[start..start + size])
         } else {
             None
         }
     }
-}
 
-/// Iterator over import descriptors
-pub struct ImportIterator<'a> {
-    pe: &'a PeImage,
-    current_rva: u32,
-    end_rva: u32,
-}
+    /// Parse export directory
+    pub fn parse_exports(&self) -> Result<Vec<ExportEntry>, MapperError> {
+        let export_dir = match self.optional_header.data_directory(DataDirectoryIndex::Export) {
+            Some(dir) if dir.is_present() => dir,
+            _ => return Ok(Vec::new()),
+        };
 
-impl<'a> ImportIterator<'a> {
-    /// Create a new import iterator
-    pub fn new(pe: &'a PeImage) -> Self {
-        let import_dir = pe.data_directory(DataDirectoryIndex::Import);
-        Self {
-            pe,
-            current_rva: import_dir.virtual_address,
-            end_rva: import_dir.virtual_address + import_dir.size,
-        }
-    }
-}
+        let export_data = self.read_at_rva(export_dir.virtual_address, mem::size_of::<ExportDirectory>())
+            .ok_or_else(|| MapperError::InvalidFormat("Cannot read export directory".into()))?;
 
-impl<'a> Iterator for ImportIterator<'a> {
-    type Item = ImportEntry<'a>;
+        let export_table: ExportDirectory = unsafe {
+            std::ptr::read_unaligned(export_data.as_ptr() as *const ExportDirectory)
+        };
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_rva >= self.end_rva {
-            return None;
-        }
+        let mut exports = Vec::new();
+        let num_functions = export_table.number_of_functions as usize;
+        let num_names = export_table.number_of_names as usize;
 
-        let desc_size = mem::size_of::<ImportDescriptor>() as u32;
-        let data = self.pe.data_at_rva(self.current_rva, desc_size as usize)?;
-        let descriptor = unsafe { &*(data.as_ptr() as *const ImportDescriptor) };
+        // Read function addresses
+        let func_rvas = self.read_at_rva(export_table.address_of_functions, num_functions * 4)
+            .ok_or_else(|| MapperError::InvalidFormat("Cannot read export function addresses".into()))?;
 
-        // Check for null terminator
-        if descriptor.name == 0 {
-            return None;
-        }
-
-        self.current_rva += desc_size;
-
-        let dll_name = self.pe.string_at_rva(descriptor.name)?;
-
-        Some(ImportEntry {
-            pe: self.pe,
-            descriptor: *descriptor,
-            dll_name,
-        })
-    }
-}
-
-/// A single import entry (DLL)
-pub struct ImportEntry<'a> {
-    pe: &'a PeImage,
-    descriptor: ImportDescriptor,
-    dll_name: &'a str,
-}
-
-impl<'a> ImportEntry<'a> {
-    /// Get the DLL name
-    pub fn dll_name(&self) -> &str {
-        self.dll_name
-    }
-
-    /// Get the import descriptor
-    pub fn descriptor(&self) -> &ImportDescriptor {
-        &self.descriptor
-    }
-
-    // TODO: Add iterator over imported functions
-}
-
-/// Iterator over exports
-pub struct ExportIterator<'a> {
-    pe: &'a PeImage,
-    export_dir: Option<ExportDirectory>,
-    current_index: u32,
-}
-
-impl<'a> ExportIterator<'a> {
-    /// Create a new export iterator
-    pub fn new(pe: &'a PeImage) -> Self {
-        let export_data = pe.data_directory(DataDirectoryIndex::Export);
-        let export_dir = if export_data.virtual_address != 0 {
-            pe.data_at_rva(export_data.virtual_address, mem::size_of::<ExportDirectory>())
-                .map(|data| unsafe { *(data.as_ptr() as *const ExportDirectory) })
+        // Read name pointers
+        let name_rvas = if num_names > 0 {
+            self.read_at_rva(export_table.address_of_names, num_names * 4)
+                .ok_or_else(|| MapperError::InvalidFormat("Cannot read export name pointers".into()))?
         } else {
-            None
+            &[]
         };
 
-        Self {
-            pe,
-            export_dir,
-            current_index: 0,
-        }
-    }
-}
+        // Read ordinals
+        let ordinals = if num_names > 0 {
+            self.read_at_rva(export_table.address_of_name_ordinals, num_names * 2)
+                .ok_or_else(|| MapperError::InvalidFormat("Cannot read export ordinals".into()))?
+        } else {
+            &[]
+        };
 
-impl<'a> Iterator for ExportIterator<'a> {
-    type Item = ExportEntry<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let export_dir = self.export_dir.as_ref()?;
-
-        if self.current_index >= export_dir.number_of_functions {
-            return None;
-        }
-
-        let func_rva_offset = export_dir.address_of_functions + self.current_index * 4;
-        let func_rva_data = self.pe.data_at_rva(func_rva_offset, 4)?;
-        let func_rva = unsafe { *(func_rva_data.as_ptr() as *const u32) };
-
-        let ordinal = export_dir.base + self.current_index;
-
-        // Try to find the name for this export
-        let name = self.find_name_for_ordinal(self.current_index as u16);
-
-        self.current_index += 1;
-
-        Some(ExportEntry {
-            rva: func_rva,
-            ordinal: ordinal as u16,
-            name,
-        })
-    }
-}
-
-impl<'a> ExportIterator<'a> {
-    fn find_name_for_ordinal(&self, ordinal_index: u16) -> Option<&'a str> {
-        let export_dir = self.export_dir.as_ref()?;
-
-        for i in 0..export_dir.number_of_names {
-            let name_ordinal_offset = export_dir.address_of_name_ordinals + i * 2;
-            let name_ordinal_data = self.pe.data_at_rva(name_ordinal_offset, 2)?;
-            let name_ordinal = unsafe { *(name_ordinal_data.as_ptr() as *const u16) };
-
-            if name_ordinal == ordinal_index {
-                let name_rva_offset = export_dir.address_of_names + i * 4;
-                let name_rva_data = self.pe.data_at_rva(name_rva_offset, 4)?;
-                let name_rva = unsafe { *(name_rva_data.as_ptr() as *const u32) };
-                return self.pe.string_at_rva(name_rva);
+        // Build ordinal to name mapping
+        let mut ordinal_to_name: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        for i in 0..num_names {
+            let ordinal = u16::from_le_bytes([ordinals[i * 2], ordinals[i * 2 + 1]]);
+            let name_rva = u32::from_le_bytes([
+                name_rvas[i * 4],
+                name_rvas[i * 4 + 1],
+                name_rvas[i * 4 + 2],
+                name_rvas[i * 4 + 3],
+            ]);
+            
+            if let Some(name) = self.read_string_at_rva(name_rva) {
+                ordinal_to_name.insert(ordinal, name);
             }
         }
 
-        None
-    }
-}
+        // Build export entries
+        let export_dir_start = export_dir.virtual_address;
+        let export_dir_end = export_dir_start + export_dir.size;
 
-/// A single export entry
-#[derive(Debug)]
-pub struct ExportEntry<'a> {
-    pub rva: u32,
-    pub ordinal: u16,
-    pub name: Option<&'a str>,
-}
+        for i in 0..num_functions {
+            let func_rva = u32::from_le_bytes([
+                func_rvas[i * 4],
+                func_rvas[i * 4 + 1],
+                func_rvas[i * 4 + 2],
+                func_rvas[i * 4 + 3],
+            ]);
 
-/// Iterator over base relocations
-pub struct RelocationIterator<'a> {
-    pe: &'a PeImage,
-    current_offset: usize,
-    end_offset: usize,
-}
-
-impl<'a> RelocationIterator<'a> {
-    /// Create a new relocation iterator
-    pub fn new(pe: &'a PeImage) -> Self {
-        let reloc_dir = pe.data_directory(DataDirectoryIndex::BaseReloc);
-        let start_offset = pe.rva_to_offset(reloc_dir.virtual_address).unwrap_or(0);
-        let end_offset = start_offset + reloc_dir.size as usize;
-
-        Self {
-            pe,
-            current_offset: start_offset,
-            end_offset,
-        }
-    }
-}
-
-impl<'a> Iterator for RelocationIterator<'a> {
-    type Item = RelocationBlock<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_offset >= self.end_offset {
-            return None;
-        }
-
-        let header_size = mem::size_of::<BaseRelocation>();
-        if self.current_offset + header_size > self.pe.data.len() {
-            return None;
-        }
-
-        let header = unsafe {
-            &*(self.pe.data.as_ptr().add(self.current_offset) as *const BaseRelocation)
-        };
-
-        if header.size_of_block == 0 {
-            return None;
-        }
-
-        let entries_offset = self.current_offset + header_size;
-        let entries_size = header.size_of_block as usize - header_size;
-        let entry_count = entries_size / 2;
-
-        let block = RelocationBlock {
-            virtual_address: header.virtual_address,
-            entries: unsafe {
-                slice::from_raw_parts(
-                    self.pe.data.as_ptr().add(entries_offset) as *const u16,
-                    entry_count,
-                )
-            },
-        };
-
-        self.current_offset += header.size_of_block as usize;
-
-        Some(block)
-    }
-}
-
-/// A relocation block
-pub struct RelocationBlock<'a> {
-    pub virtual_address: u32,
-    pub entries: &'a [u16],
-}
-
-impl<'a> RelocationBlock<'a> {
-    /// Iterate over relocation entries in this block
-    pub fn iter(&self) -> impl Iterator<Item = (u32, RelocationType)> + '_ {
-        self.entries.iter().filter_map(move |&entry| {
-            let reloc_type = (entry >> 12) as u16;
-            let offset = (entry & 0x0FFF) as u32;
-
-            if reloc_type == 0 {
-                return None; // Padding entry
+            if func_rva == 0 {
+                continue;
             }
 
-            let rva = self.virtual_address + offset;
-            RelocationType::try_from(reloc_type)
-                .ok()
-                .map(|t| (rva, t))
-        })
+            let ordinal = (i as u32 + export_table.base) as u16;
+            let name = ordinal_to_name.get(&(i as u16)).cloned();
+
+            // Check if this is a forwarder
+            let forwarded_to = if func_rva >= export_dir_start && func_rva < export_dir_end {
+                self.read_string_at_rva(func_rva)
+            } else {
+                None
+            };
+
+            exports.push(ExportEntry {
+                ordinal,
+                name,
+                rva: func_rva,
+                forwarded_to,
+            });
+        }
+
+        Ok(exports)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dos_signature() {
-        assert_eq!(DOS_SIGNATURE, 0x5A4D);
-    }
-
-    #[test]
-    fn test_pe_signature() {
-        assert_eq!(PE_SIGNATURE, 0x00004550);
-    }
-
-    #[test]
-    fn test_section_header_name() {
-        let mut header = SectionHeader {
-            name: [0; 8],
-            virtual_size: 0,
-            virtual_address: 0,
-            size_of_raw_data: 0,
-            pointer_to_raw_data: 0,
-            pointer_to_relocations: 0,
-            pointer_to_linenumbers: 0,
-            number_of_relocations: 0,
-            number_of_linenumbers: 0,
-            characteristics: 0,
+    /// Parse import directory
+    pub fn parse_imports(&self) -> Result<Vec<ImportEntry>, MapperError> {
+        let import_dir = match self.optional_header.data_directory(DataDirectoryIndex::Import) {
+            Some(dir) if dir.is_present() => dir,
+            _ => return Ok(Vec::new()),
         };
 
-        header.name[0] = b'.';
-        header.name[1] = b't';
-        header.name[2] = b'e';
-        header.name[3] = b'x';
-        header.name[4] = b't';
+        let mut imports = Vec::new();
+        let mut offset = 0;
 
-        assert_eq!(header.name_str(), ".text");
+        loop {
+            let desc_data = self.read_at_rva(
+                import_dir.virtual_address + offset,
+                mem::size_of::<ImportDescriptor>()
+            ).ok_or_else(|| MapperError::InvalidFormat("Cannot read import descriptor".into()))?;
+
+            let descriptor: ImportDescriptor = unsafe {
+                std::ptr::read_unaligned(desc_data.as_ptr() as *const ImportDescriptor)
+            };
+
+            if descriptor.is_null() {
+                break;
+            }
+
+            let dll_name = self.read_string_at_rva(descriptor.name)
+                .ok_or_else(|| MapperError::InvalidFormat("Cannot read import DLL name".into()))?;
+
+            let functions = self.parse_import_thunks(
+                if descriptor.original_first_thunk != 0 {
+                    descriptor.original_first_thunk
+                } else {
+                    descriptor.first_thunk
+                }
+            )?;
+
+            imports.push(ImportEntry {
+                dll_name,
+                functions,
+            });
+
+            offset += mem::size_of::<ImportDescriptor>() as u32;
+        }
+
+        Ok(imports)
     }
 
-    #[test]
-    fn test_relocation_type_conversion() {
-        assert_eq!(
-            RelocationType::try_from(0).unwrap(),
-            RelocationType::Absolute
-        );
-        assert_eq!(
-            RelocationType::try_from(3).unwrap(),
-            RelocationType::HighLow
-        );
-        assert_eq!(RelocationType::try_from(10).unwrap(), RelocationType::Dir64);
-        assert!(RelocationType::try_from(99).is_err());
-    }
-}
+    /// Parse import thunks (lookup table)
+    fn parse_import_thunks(&self, thunk_rva: u32) -> Result<Vec<ImportFunction>, MapperError> {
+        let mut functions = Vec::new();
+        let is_64bit = self.optional_header.is_64bit();
+        let thunk_size = if is_64bit { 8 } else { 4 };
+        let ordinal_flag: u64 = if is_64bit { 0x8000000000000000 } else { 0x80000000 };
+
+        let mut offset = 0u32;
+
+        loop {
+            let thunk_data = self.read_at_rva(thunk_rva + offset, thunk_size)
+                .ok_or_else(|| MapperError::InvalidFormat("Cannot read import thunk".into()))?;
+
+            let thunk_value: u64 = if is_64bit {
+                u64::from_le_bytes([
+                    thunk_data[0], thunk_data[1], thunk_data[2], thunk_data[3],
+                    thunk_data[4], thunk_data[5], thunk_data[6], thunk_data[7],
+                ])
+            } else {
+                u32::from_le_bytes([
+                    thunk_data[0], thunk_data[1], thunk_data[2], thunk_data[3],
+                ]) as u64
+            };
+
+            if thunk_value == 0 {
+                break;
+            }
+
+            let function = if thunk_value & ordinal_flag != 0 {
+                // Import by ordinal
+                ImportFunction {
+                    name: None,
+                    ordinal: Some((thunk_value & 0xFFFF) as u16),
+                    hint: 0,
+                }
+            } else {
+                // Import by name
+                let hint_name_rva = (thunk_value & 0x7FFFFFFF) as u
