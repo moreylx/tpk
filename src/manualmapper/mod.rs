@@ -18,6 +18,8 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::RwLock;
 
 /// Memory protection flags for allocated regions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +65,7 @@ impl MemoryProtection {
     }
 }
 
-/// Allocation type flags
+/// Allocation type flags for memory operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AllocationType {
@@ -81,420 +83,565 @@ impl AllocationType {
     pub fn as_raw(&self) -> u32 {
         *self as u32
     }
+    
+    pub fn combine(flags: &[AllocationType]) -> u32 {
+        flags.iter().fold(0u32, |acc, f| acc | f.as_raw())
+    }
 }
 
-/// Represents a remote memory allocation in a target process
+/// Represents a mapped memory region within a target process
 #[derive(Debug)]
-pub struct RemoteAllocation {
-    process_handle: SafeHandle,
+pub struct MappedRegion {
     base_address: NonNull<c_void>,
     size: usize,
-    freed: bool,
+    protection: MemoryProtection,
+    committed: bool,
 }
 
-impl RemoteAllocation {
-    /// Creates a new remote allocation tracker
-    /// 
-    /// # Safety
-    /// The caller must ensure the base_address points to valid allocated memory
-    /// in the target process
-    pub unsafe fn new(
-        process_handle: SafeHandle,
-        base_address: *mut c_void,
+impl MappedRegion {
+    /// Creates a new mapped region descriptor
+    pub fn new(
+        base: *mut c_void,
         size: usize,
+        protection: MemoryProtection,
     ) -> Result<Self, MapperError> {
-        let base = NonNull::new(base_address)
-            .ok_or(MapperError::AllocationFailed)?;
+        let base_address = NonNull::new(base)
+            .ok_or(MapperError::InvalidAddress)?;
         
         Ok(Self {
-            process_handle,
-            base_address: base,
+            base_address,
             size,
-            freed: false,
+            protection,
+            committed: true,
         })
     }
     
+    /// Returns the base address of the region
     pub fn base(&self) -> *mut c_void {
         self.base_address.as_ptr()
+    }
+    
+    /// Returns the size of the region in bytes
+    pub fn size(&self) -> usize {
+        self.size
+    }
+    
+    /// Returns the memory protection of the region
+    pub fn protection(&self) -> MemoryProtection {
+        self.protection
+    }
+    
+    /// Checks if the region is committed
+    pub fn is_committed(&self) -> bool {
+        self.committed
+    }
+}
+
+/// Runtime state for tracking mapped modules
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeState {
+    Uninitialized,
+    Initializing,
+    Running,
+    Suspended,
+    ShuttingDown,
+    Terminated,
+}
+
+/// Observer trait for runtime events
+pub trait RuntimeObserver: Send + Sync {
+    fn on_state_change(&self, old_state: RuntimeState, new_state: RuntimeState);
+    fn on_module_mapped(&self, module_name: &str, base_address: usize);
+    fn on_module_unmapped(&self, module_name: &str);
+    fn on_error(&self, error: &MapperError);
+}
+
+/// Strategy trait for memory allocation
+pub trait AllocationStrategy: Send + Sync {
+    fn allocate(
+        &self,
+        process_handle: &SafeHandle,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<MappedRegion, MapperError>;
+    
+    fn deallocate(
+        &self,
+        process_handle: &SafeHandle,
+        region: &MappedRegion,
+    ) -> Result<(), MapperError>;
+    
+    fn change_protection(
+        &self,
+        process_handle: &SafeHandle,
+        region: &MappedRegion,
+        new_protection: MemoryProtection,
+    ) -> Result<MemoryProtection, MapperError>;
+}
+
+/// Default allocation strategy using standard NT APIs
+pub struct DefaultAllocationStrategy;
+
+impl AllocationStrategy for DefaultAllocationStrategy {
+    fn allocate(
+        &self,
+        _process_handle: &SafeHandle,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<MappedRegion, MapperError> {
+        // Placeholder for actual NT allocation
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        
+        if aligned_size == 0 {
+            return Err(MapperError::InvalidSize);
+        }
+        
+        // In real implementation, this would call NtAllocateVirtualMemory
+        Err(MapperError::NotImplemented)
+    }
+    
+    fn deallocate(
+        &self,
+        _process_handle: &SafeHandle,
+        _region: &MappedRegion,
+    ) -> Result<(), MapperError> {
+        // In real implementation, this would call NtFreeVirtualMemory
+        Err(MapperError::NotImplemented)
+    }
+    
+    fn change_protection(
+        &self,
+        _process_handle: &SafeHandle,
+        _region: &MappedRegion,
+        _new_protection: MemoryProtection,
+    ) -> Result<MemoryProtection, MapperError> {
+        // In real implementation, this would call NtProtectVirtualMemory
+        Err(MapperError::NotImplemented)
+    }
+}
+
+/// Tracked module information
+#[derive(Debug)]
+pub struct TrackedModule {
+    name: String,
+    base_address: usize,
+    size: usize,
+    entry_point: Option<usize>,
+    regions: Vec<MappedRegion>,
+    load_time: std::time::Instant,
+}
+
+impl TrackedModule {
+    pub fn new(name: String, base_address: usize, size: usize) -> Self {
+        Self {
+            name,
+            base_address,
+            size,
+            entry_point: None,
+            regions: Vec::new(),
+            load_time: std::time::Instant::now(),
+        }
+    }
+    
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    
+    pub fn base_address(&self) -> usize {
+        self.base_address
     }
     
     pub fn size(&self) -> usize {
         self.size
     }
     
-    /// Manually free the allocation before drop
-    pub fn free(&mut self) -> Result<(), MapperError> {
-        if self.freed {
-            return Ok(());
+    pub fn entry_point(&self) -> Option<usize> {
+        self.entry_point
+    }
+    
+    pub fn set_entry_point(&mut self, entry: usize) {
+        self.entry_point = Some(entry);
+    }
+    
+    pub fn add_region(&mut self, region: MappedRegion) {
+        self.regions.push(region);
+    }
+    
+    pub fn uptime(&self) -> std::time::Duration {
+        self.load_time.elapsed()
+    }
+}
+
+/// Central runtime manager for coordinating mapping operations
+pub struct RuntimeManager {
+    state: RwLock<RuntimeState>,
+    initialized: AtomicBool,
+    operation_counter: AtomicU64,
+    modules: RwLock<HashMap<String, TrackedModule>>,
+    observers: RwLock<Vec<Arc<dyn RuntimeObserver>>>,
+    allocation_strategy: RwLock<Arc<dyn AllocationStrategy>>,
+    process_handle: RwLock<Option<SafeHandle>>,
+}
+
+impl RuntimeManager {
+    /// Creates a new RuntimeManager instance
+    pub fn new() -> Self {
+        Self {
+            state: RwLock::new(RuntimeState::Uninitialized),
+            initialized: AtomicBool::new(false),
+            operation_counter: AtomicU64::new(0),
+            modules: RwLock::new(HashMap::new()),
+            observers: RwLock::new(Vec::new()),
+            allocation_strategy: RwLock::new(Arc::new(DefaultAllocationStrategy)),
+            process_handle: RwLock::new(None),
+        }
+    }
+    
+    /// Initializes the runtime manager with a target process handle
+    pub fn initialize(&self, process_handle: SafeHandle) -> Result<(), MapperError> {
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        
+        if *state != RuntimeState::Uninitialized {
+            return Err(MapperError::AlreadyInitialized);
         }
         
-        // TODO: Call NtFreeVirtualMemory
-        self.freed = true;
+        let old_state = *state;
+        *state = RuntimeState::Initializing;
+        drop(state);
+        
+        self.notify_state_change(old_state, RuntimeState::Initializing);
+        
+        // Store the process handle
+        {
+            let mut handle_guard = self.process_handle.write()
+                .map_err(|_| MapperError::LockPoisoned)?;
+            *handle_guard = Some(process_handle);
+        }
+        
+        // Transition to running state
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        *state = RuntimeState::Running;
+        self.initialized.store(true, Ordering::SeqCst);
+        
+        self.notify_state_change(RuntimeState::Initializing, RuntimeState::Running);
+        
+        Ok(())
+    }
+    
+    /// Checks if the runtime is initialized and running
+    pub fn is_running(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst) && 
+            matches!(
+                self.state.read().ok().map(|s| *s),
+                Some(RuntimeState::Running)
+            )
+    }
+    
+    /// Returns the current runtime state
+    pub fn state(&self) -> Result<RuntimeState, MapperError> {
+        self.state.read()
+            .map(|s| *s)
+            .map_err(|_| MapperError::LockPoisoned)
+    }
+    
+    /// Suspends runtime operations
+    pub fn suspend(&self) -> Result<(), MapperError> {
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        
+        if *state != RuntimeState::Running {
+            return Err(MapperError::InvalidState);
+        }
+        
+        let old_state = *state;
+        *state = RuntimeState::Suspended;
+        drop(state);
+        
+        self.notify_state_change(old_state, RuntimeState::Suspended);
+        Ok(())
+    }
+    
+    /// Resumes runtime operations
+    pub fn resume(&self) -> Result<(), MapperError> {
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        
+        if *state != RuntimeState::Suspended {
+            return Err(MapperError::InvalidState);
+        }
+        
+        let old_state = *state;
+        *state = RuntimeState::Running;
+        drop(state);
+        
+        self.notify_state_change(old_state, RuntimeState::Running);
+        Ok(())
+    }
+    
+    /// Shuts down the runtime manager
+    pub fn shutdown(&self) -> Result<(), MapperError> {
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        
+        match *state {
+            RuntimeState::Uninitialized | RuntimeState::Terminated => {
+                return Ok(());
+            }
+            RuntimeState::ShuttingDown => {
+                return Err(MapperError::ShutdownInProgress);
+            }
+            _ => {}
+        }
+        
+        let old_state = *state;
+        *state = RuntimeState::ShuttingDown;
+        drop(state);
+        
+        self.notify_state_change(old_state, RuntimeState::ShuttingDown);
+        
+        // Unmap all modules
+        self.unmap_all_modules()?;
+        
+        // Clear process handle
+        {
+            let mut handle_guard = self.process_handle.write()
+                .map_err(|_| MapperError::LockPoisoned)?;
+            *handle_guard = None;
+        }
+        
+        // Finalize shutdown
+        let mut state = self.state.write().map_err(|_| MapperError::LockPoisoned)?;
+        *state = RuntimeState::Terminated;
+        self.initialized.store(false, Ordering::SeqCst);
+        
+        self.notify_state_change(RuntimeState::ShuttingDown, RuntimeState::Terminated);
+        
+        Ok(())
+    }
+    
+    /// Registers an observer for runtime events
+    pub fn register_observer(&self, observer: Arc<dyn RuntimeObserver>) -> Result<(), MapperError> {
+        let mut observers = self.observers.write()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        observers.push(observer);
+        Ok(())
+    }
+    
+    /// Sets a custom allocation strategy
+    pub fn set_allocation_strategy(
+        &self,
+        strategy: Arc<dyn AllocationStrategy>,
+    ) -> Result<(), MapperError> {
+        let mut current = self.allocation_strategy.write()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        *current = strategy;
+        Ok(())
+    }
+    
+    /// Tracks a newly mapped module
+    pub fn track_module(&self, module: TrackedModule) -> Result<(), MapperError> {
+        if !self.is_running() {
+            return Err(MapperError::NotInitialized);
+        }
+        
+        let module_name = module.name().to_string();
+        let base_address = module.base_address();
+        
+        {
+            let mut modules = self.modules.write()
+                .map_err(|_| MapperError::LockPoisoned)?;
+            
+            if modules.contains_key(&module_name) {
+                return Err(MapperError::ModuleAlreadyLoaded);
+            }
+            
+            modules.insert(module_name.clone(), module);
+        }
+        
+        self.increment_operation_counter();
+        self.notify_module_mapped(&module_name, base_address);
+        
+        Ok(())
+    }
+    
+    /// Untracks and prepares a module for unmapping
+    pub fn untrack_module(&self, name: &str) -> Result<TrackedModule, MapperError> {
+        if !self.is_running() {
+            return Err(MapperError::NotInitialized);
+        }
+        
+        let module = {
+            let mut modules = self.modules.write()
+                .map_err(|_| MapperError::LockPoisoned)?;
+            
+            modules.remove(name)
+                .ok_or(MapperError::ModuleNotFound)?
+        };
+        
+        self.increment_operation_counter();
+        self.notify_module_unmapped(name);
+        
+        Ok(module)
+    }
+    
+    /// Returns information about a tracked module
+    pub fn get_module_info(&self, name: &str) -> Result<(usize, usize, Option<usize>), MapperError> {
+        let modules = self.modules.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        let module = modules.get(name)
+            .ok_or(MapperError::ModuleNotFound)?;
+        
+        Ok((module.base_address(), module.size(), module.entry_point()))
+    }
+    
+    /// Lists all tracked module names
+    pub fn list_modules(&self) -> Result<Vec<String>, MapperError> {
+        let modules = self.modules.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        Ok(modules.keys().cloned().collect())
+    }
+    
+    /// Returns the total number of operations performed
+    pub fn operation_count(&self) -> u64 {
+        self.operation_counter.load(Ordering::Relaxed)
+    }
+    
+    /// Allocates memory in the target process
+    pub fn allocate_memory(
+        &self,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<MappedRegion, MapperError> {
+        if !self.is_running() {
+            return Err(MapperError::NotInitialized);
+        }
+        
+        let handle_guard = self.process_handle.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        let handle = handle_guard.as_ref()
+            .ok_or(MapperError::InvalidHandle)?;
+        
+        let strategy = self.allocation_strategy.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        let region = strategy.allocate(handle, size, protection)?;
+        self.increment_operation_counter();
+        
+        Ok(region)
+    }
+    
+    /// Deallocates memory in the target process
+    pub fn deallocate_memory(&self, region: &MappedRegion) -> Result<(), MapperError> {
+        if !self.is_running() {
+            return Err(MapperError::NotInitialized);
+        }
+        
+        let handle_guard = self.process_handle.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        let handle = handle_guard.as_ref()
+            .ok_or(MapperError::InvalidHandle)?;
+        
+        let strategy = self.allocation_strategy.read()
+            .map_err(|_| MapperError::LockPoisoned)?;
+        
+        strategy.deallocate(handle, region)?;
+        self.increment_operation_counter();
+        
+        Ok(())
+    }
+    
+    // Private helper methods
+    
+    fn increment_operation_counter(&self) {
+        self.operation_counter.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    fn notify_state_change(&self, old_state: RuntimeState, new_state: RuntimeState) {
+        if let Ok(observers) = self.observers.read() {
+            for observer in observers.iter() {
+                observer.on_state_change(old_state, new_state);
+            }
+        }
+    }
+    
+    fn notify_module_mapped(&self, name: &str, base_address: usize) {
+        if let Ok(observers) = self.observers.read() {
+            for observer in observers.iter() {
+                observer.on_module_mapped(name, base_address);
+            }
+        }
+    }
+    
+    fn notify_module_unmapped(&self, name: &str) {
+        if let Ok(observers) = self.observers.read() {
+            for observer in observers.iter() {
+                observer.on_module_unmapped(name);
+            }
+        }
+    }
+    
+    fn notify_error(&self, error: &MapperError) {
+        if let Ok(observers) = self.observers.read() {
+            for observer in observers.iter() {
+                observer.on_error(error);
+            }
+        }
+    }
+    
+    fn unmap_all_modules(&self) -> Result<(), MapperError> {
+        let module_names: Vec<String> = {
+            let modules = self.modules.read()
+                .map_err(|_| MapperError::LockPoisoned)?;
+            modules.keys().cloned().collect()
+        };
+        
+        for name in module_names {
+            if let Err(e) = self.untrack_module(&name) {
+                self.notify_error(&e);
+            }
+        }
+        
         Ok(())
     }
 }
 
-impl Drop for RemoteAllocation {
-    fn drop(&mut self) {
-        if !self.freed {
-            let _ = self.free();
-        }
-    }
-}
-
-/// Configuration for the manual mapping operation
-#[derive(Debug, Clone)]
-pub struct MapperConfig {
-    /// Whether to erase PE headers after mapping
-    pub erase_headers: bool,
-    /// Whether to hide the mapped module from PEB
-    pub hide_from_peb: bool,
-    /// Whether to execute TLS callbacks
-    pub execute_tls: bool,
-    /// Custom entry point offset (None uses DllMain)
-    pub custom_entry: Option<usize>,
-    /// Additional flags for allocation
-    pub allocation_flags: u32,
-}
-
-impl Default for MapperConfig {
-    fn default() -> Self {
-        Self {
-            erase_headers: true,
-            hide_from_peb: true,
-            execute_tls: true,
-            custom_entry: None,
-            allocation_flags: AllocationType::Commit as u32 | AllocationType::Reserve as u32,
-        }
-    }
-}
-
-/// Injection method strategy
-pub trait InjectionStrategy: Send + Sync {
-    /// Execute code in the target process
-    fn execute(
-        &self,
-        process: &ProcessContext,
-        entry_point: *const c_void,
-        parameter: *const c_void,
-    ) -> Result<u32, MapperError>;
-    
-    /// Name of the injection method
-    fn name(&self) -> &'static str;
-}
-
-/// Thread hijacking injection strategy
-pub struct ThreadHijackStrategy {
-    timeout_ms: u32,
-}
-
-impl ThreadHijackStrategy {
-    pub fn new(timeout_ms: u32) -> Self {
-        Self { timeout_ms }
-    }
-}
-
-impl InjectionStrategy for ThreadHijackStrategy {
-    fn execute(
-        &self,
-        process: &ProcessContext,
-        entry_point: *const c_void,
-        parameter: *const c_void,
-    ) -> Result<u32, MapperError> {
-        // TODO: Implement thread hijacking
-        // 1. Enumerate threads
-        // 2. Suspend a suitable thread
-        // 3. Get/Set thread context
-        // 4. Redirect execution
-        // 5. Resume thread
-        Err(MapperError::NotImplemented)
-    }
-    
-    fn name(&self) -> &'static str {
-        "ThreadHijack"
-    }
-}
-
-/// Remote thread creation strategy
-pub struct RemoteThreadStrategy {
-    wait_for_completion: bool,
-}
-
-impl RemoteThreadStrategy {
-    pub fn new(wait_for_completion: bool) -> Self {
-        Self { wait_for_completion }
-    }
-}
-
-impl InjectionStrategy for RemoteThreadStrategy {
-    fn execute(
-        &self,
-        process: &ProcessContext,
-        entry_point: *const c_void,
-        parameter: *const c_void,
-    ) -> Result<u32, MapperError> {
-        // TODO: Implement NtCreateThreadEx
-        Err(MapperError::NotImplemented)
-    }
-    
-    fn name(&self) -> &'static str {
-        "RemoteThread"
-    }
-}
-
-/// APC injection strategy
-pub struct ApcInjectionStrategy;
-
-impl InjectionStrategy for ApcInjectionStrategy {
-    fn execute(
-        &self,
-        process: &ProcessContext,
-        entry_point: *const c_void,
-        parameter: *const c_void,
-    ) -> Result<u32, MapperError> {
-        // TODO: Implement APC injection via NtQueueApcThread
-        Err(MapperError::NotImplemented)
-    }
-    
-    fn name(&self) -> &'static str {
-        "ApcInjection"
-    }
-}
-
-/// Process context containing handles and metadata
-#[derive(Debug)]
-pub struct ProcessContext {
-    handle: SafeHandle,
-    pid: u32,
-    is_wow64: bool,
-    base_address: Option<*const c_void>,
-    loaded_modules: HashMap<String, ModuleInfo>,
-}
-
-impl ProcessContext {
-    /// Open a process by PID
-    pub fn open(pid: u32, access: u32) -> Result<Self, MapperError> {
-        // TODO: Implement NtOpenProcess
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Attach to current process
-    pub fn current() -> Self {
-        Self {
-            handle: SafeHandle::invalid(), // TODO: Use GetCurrentProcess
-            pid: std::process::id(),
-            is_wow64: cfg!(target_pointer_width = "32"),
-            base_address: None,
-            loaded_modules: HashMap::new(),
-        }
-    }
-    
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-    
-    pub fn is_wow64(&self) -> bool {
-        self.is_wow64
-    }
-    
-    pub fn handle(&self) -> &SafeHandle {
-        &self.handle
-    }
-    
-    /// Read memory from the target process
-    pub fn read_memory(&self, address: *const c_void, buffer: &mut [u8]) -> Result<usize, MapperError> {
-        // TODO: Implement NtReadVirtualMemory
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Write memory to the target process
-    pub fn write_memory(&self, address: *mut c_void, buffer: &[u8]) -> Result<usize, MapperError> {
-        // TODO: Implement NtWriteVirtualMemory
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Allocate memory in the target process
-    pub fn allocate(
-        &self,
-        size: usize,
-        protection: MemoryProtection,
-        allocation_type: u32,
-    ) -> Result<RemoteAllocation, MapperError> {
-        // TODO: Implement NtAllocateVirtualMemory
-        Err(MapperError::AllocationFailed)
-    }
-    
-    /// Change memory protection
-    pub fn protect(
-        &self,
-        address: *mut c_void,
-        size: usize,
-        new_protection: MemoryProtection,
-    ) -> Result<MemoryProtection, MapperError> {
-        // TODO: Implement NtProtectVirtualMemory
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Query information about a memory region
-    pub fn query_memory(&self, address: *const c_void) -> Result<MemoryBasicInfo, MapperError> {
-        // TODO: Implement NtQueryVirtualMemory
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Enumerate loaded modules in the target process
-    pub fn enumerate_modules(&mut self) -> Result<&HashMap<String, ModuleInfo>, MapperError> {
-        if !self.loaded_modules.is_empty() {
-            return Ok(&self.loaded_modules);
-        }
-        
-        // TODO: Walk PEB->Ldr->InLoadOrderModuleList
-        Err(MapperError::NotImplemented)
-    }
-    
-    /// Find a module by name
-    pub fn find_module(&mut self, name: &str) -> Result<Option<&ModuleInfo>, MapperError> {
-        self.enumerate_modules()?;
-        Ok(self.loaded_modules.get(&name.to_lowercase()))
-    }
-}
-
-/// Information about a loaded module
-#[derive(Debug, Clone)]
-pub struct ModuleInfo {
-    pub name: String,
-    pub base_address: *const c_void,
-    pub size: usize,
-    pub entry_point: *const c_void,
-    pub full_path: String,
-}
-
-/// Memory region information
-#[derive(Debug, Clone)]
-pub struct MemoryBasicInfo {
-    pub base_address: *const c_void,
-    pub allocation_base: *const c_void,
-    pub allocation_protect: MemoryProtection,
-    pub region_size: usize,
-    pub state: u32,
-    pub protect: MemoryProtection,
-    pub memory_type: u32,
-}
-
-/// Observer trait for mapping events
-pub trait MappingObserver: Send + Sync {
-    fn on_allocation(&self, base: *const c_void, size: usize) {}
-    fn on_sections_mapped(&self, count: usize) {}
-    fn on_relocations_applied(&self, count: usize) {}
-    fn on_imports_resolved(&self, count: usize) {}
-    fn on_tls_executed(&self, callback_count: usize) {}
-    fn on_entry_called(&self, entry: *const c_void) {}
-    fn on_error(&self, error: &MapperError) {}
-    fn on_complete(&self, base: *const c_void) {}
-}
-
-/// Default no-op observer
-pub struct NullObserver;
-impl MappingObserver for NullObserver {}
-
-/// Logging observer for debugging
-pub struct LoggingObserver {
-    prefix: String,
-}
-
-impl LoggingObserver {
-    pub fn new(prefix: impl Into<String>) -> Self {
-        Self { prefix: prefix.into() }
-    }
-}
-
-impl MappingObserver for LoggingObserver {
-    fn on_allocation(&self, base: *const c_void, size: usize) {
-        eprintln!("[{}] Allocated {:?} ({} bytes)", self.prefix, base, size);
-    }
-    
-    fn on_sections_mapped(&self, count: usize) {
-        eprintln!("[{}] Mapped {} sections", self.prefix, count);
-    }
-    
-    fn on_relocations_applied(&self, count: usize) {
-        eprintln!("[{}] Applied {} relocations", self.prefix, count);
-    }
-    
-    fn on_imports_resolved(&self, count: usize) {
-        eprintln!("[{}] Resolved {} imports", self.prefix, count);
-    }
-    
-    fn on_entry_called(&self, entry: *const c_void) {
-        eprintln!("[{}] Calling entry point at {:?}", self.prefix, entry);
-    }
-    
-    fn on_error(&self, error: &MapperError) {
-        eprintln!("[{}] Error: {:?}", self.prefix, error);
-    }
-    
-    fn on_complete(&self, base: *const c_void) {
-        eprintln!("[{}] Mapping complete at {:?}", self.prefix, base);
-    }
-}
-
-/// Builder for creating ManualMapper instances
-pub struct MapperBuilder {
-    config: MapperConfig,
-    strategy: Option<Arc<dyn InjectionStrategy>>,
-    observer: Option<Arc<dyn MappingObserver>>,
-}
-
-impl MapperBuilder {
-    pub fn new() -> Self {
-        Self {
-            config: MapperConfig::default(),
-            strategy: None,
-            observer: None,
-        }
-    }
-    
-    pub fn config(mut self, config: MapperConfig) -> Self {
-        self.config = config;
-        self
-    }
-    
-    pub fn erase_headers(mut self, erase: bool) -> Self {
-        self.config.erase_headers = erase;
-        self
-    }
-    
-    pub fn hide_from_peb(mut self, hide: bool) -> Self {
-        self.config.hide_from_peb = hide;
-        self
-    }
-    
-    pub fn execute_tls(mut self, execute: bool) -> Self {
-        self.config.execute_tls = execute;
-        self
-    }
-    
-    pub fn strategy<S: InjectionStrategy + 'static>(mut self, strategy: S) -> Self {
-        self.strategy = Some(Arc::new(strategy));
-        self
-    }
-    
-    pub fn observer<O: MappingObserver + 'static>(mut self, observer: O) -> Self {
-        self.observer = Some(Arc::new(observer));
-        self
-    }
-    
-    pub fn build(self) -> ManualMapper {
-        ManualMapper {
-            config: self.config,
-            strategy: self.strategy.unwrap_or_else(|| Arc::new(RemoteThreadStrategy::new(true))),
-            observer: self.observer.unwrap_or_else(|| Arc::new(NullObserver)),
-        }
-    }
-}
-
-impl Default for MapperBuilder {
+impl Default for RuntimeManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for RuntimeManager {
+    fn drop(&mut self) {
+        // Attempt graceful shutdown on drop
+        let _ = self.shutdown();
+    }
+}
+
+/// Factory for creating RuntimeManager instances with different configurations
+pub struct RuntimeManagerFactory;
+
+impl RuntimeManagerFactory {
+    /// Creates a default RuntimeManager
+    pub fn create_default() -> RuntimeManager {
+        RuntimeManager::new()
+    }
+    
+    /// Creates a RuntimeManager with a custom allocation strategy
+    pub fn create_with_strategy(strategy: Arc<dyn AllocationStrategy>) -> RuntimeManager {
+        let manager = RuntimeManager::new();
+        let _ = manager.set_allocation_strategy(strategy);
+        manager
+    }
+    
+    /// Creates a RuntimeManager with pre-registered observers
+    pub fn create_with_observers(observers: Vec<Arc<dyn RuntimeObserver>>) -> RuntimeManager {
+        let manager = RuntimeManager::new();
+        for observer in observers {
+            let _ = manager.register_observer(observer);
+        }
+        manager
     }
 }
 
@@ -515,416 +662,32 @@ mod tests {
     }
     
     #[test]
-    fn test_mapper_builder() {
-        let mapper = MapperBuilder::new()
-            .erase_headers(false)
-            .hide_from_peb(true)
-            .strategy(RemoteThreadStrategy::new(false))
-            .observer(LoggingObserver::new("test"))
-            .build();
-        
-        assert!(!mapper.config.erase_headers);
-        assert!(mapper.config.hide_from_peb);
+    fn test_allocation_type_combine() {
+        let combined = AllocationType::combine(&[
+            AllocationType::Commit,
+            AllocationType::Reserve,
+        ]);
+        assert_eq!(combined, 0x3000);
     }
     
     #[test]
-    fn test_default_config() {
-        let config = MapperConfig::default();
-        assert!(config.erase_headers);
-        assert!(config.hide_from_peb);
-        assert!(config.execute_tls);
-        assert!(config.custom_entry.is_none());
+    fn test_runtime_manager_initial_state() {
+        let manager = RuntimeManager::new();
+        assert_eq!(manager.state().unwrap(), RuntimeState::Uninitialized);
+        assert!(!manager.is_running());
+    }
+    
+    #[test]
+    fn test_tracked_module_creation() {
+        let module = TrackedModule::new(
+            "test.dll".to_string(),
+            0x10000000,
+            0x5000,
+        );
+        
+        assert_eq!(module.name(), "test.dll");
+        assert_eq!(module.base_address(), 0x10000000);
+        assert_eq!(module.size(), 0x5000);
+        assert!(module.entry_point().is_none());
     }
 }
-```
-
-```rust
-// src/manualmapper/injector.rs
-//! Core manual mapper implementation
-
-use super::*;
-use std::sync::Arc;
-
-/// Manual mapper for injecting PE images into processes
-pub struct ManualMapper {
-    pub(crate) config: MapperConfig,
-    pub(crate) strategy: Arc<dyn InjectionStrategy>,
-    pub(crate) observer: Arc<dyn MappingObserver>,
-}
-
-impl ManualMapper {
-    /// Create a new mapper with default settings
-    pub fn new() -> Self {
-        MapperBuilder::new().build()
-    }
-    
-    /// Create a builder for customized mapper configuration
-    pub fn builder() -> MapperBuilder {
-        MapperBuilder::new()
-    }
-    
-    /// Map a PE image into the target process
-    pub fn map_image(
-        &self,
-        process: &mut ProcessContext,
-        image_data: &[u8],
-    ) -> Result<MappedImage, MapperError> {
-        // Parse the PE image
-        let pe = PeImage::parse(image_data)?;
-        
-        // Validate architecture compatibility
-        if pe.is_64bit() != !process.is_wow64() {
-            return Err(MapperError::ArchitectureMismatch);
-        }
-        
-        // Allocate memory in target process
-        let allocation = process.allocate(
-            pe.image_size(),
-            MemoryProtection::ExecuteReadWrite,
-            self.config.allocation_flags,
-        )?;
-        
-        self.observer.on_allocation(allocation.base(), allocation.size());
-        
-        // Map sections
-        let sections_mapped = self.map_sections(process, &pe, &allocation)?;
-        self.observer.on_sections_mapped(sections_mapped);
-        
-        // Apply relocations
-        let delta = allocation.base() as isize - pe.preferred_base() as isize;
-        if delta != 0 {
-            let relocs_applied = self.apply_relocations(process, &pe, &allocation, delta)?;
-            self.observer.on_relocations_applied(relocs_applied);
-        }
-        
-        // Resolve imports
-        let imports_resolved = self.resolve_imports(process, &pe, &allocation)?;
-        self.observer.on_imports_resolved(imports_resolved);
-        
-        // Execute TLS callbacks if configured
-        if self.config.execute_tls {
-            let tls_count = self.execute_tls_callbacks(process, &pe, &allocation)?;
-            self.observer.on_tls_executed(tls_count);
-        }
-        
-        // Set proper section protections
-        self.apply_section_protections(process, &pe, &allocation)?;
-        
-        // Erase headers if configured
-        if self.config.erase_headers {
-            self.erase_pe_headers(process, &allocation, pe.headers_size())?;
-        }
-        
-        // Call entry point
-        let entry_point = unsafe {
-            allocation.base().add(pe.entry_point_rva())
-        };
-        
-        self.observer.on_entry_called(entry_point);
-        
-        let exit_code = self.strategy.execute(
-            process,
-            entry_point,
-            allocation.base(),
-        )?;
-        
-        self.observer.on_complete(allocation.base());
-        
-        Ok(MappedImage {
-            base_address: allocation.base(),
-            size: allocation.size(),
-            entry_point,
-            exit_code,
-        })
-    }
-    
-    fn map_sections(
-        &self,
-        process: &ProcessContext,
-        pe: &PeImage,
-        allocation: &RemoteAllocation,
-    ) -> Result<usize, MapperError> {
-        // First, write headers
-        process.write_memory(
-            allocation.base(),
-            pe.headers_data(),
-        )?;
-        
-        let mut count = 0;
-        for section in pe.sections() {
-            if section.raw_size == 0 {
-                continue;
-            }
-            
-            let dest = unsafe {
-                allocation.base().add(section.virtual_address as usize)
-            };
-            
-            let data = pe.section_data(&section)?;
-            process.write_memory(dest, data)?;
-            count += 1;
-        }
-        
-        Ok(count)
-    }
-    
-    fn apply_relocations(
-        &self,
-        process: &ProcessContext,
-        pe: &PeImage,
-        allocation: &RemoteAllocation,
-        delta: isize,
-    ) -> Result<usize, MapperError> {
-        let mut count = 0;
-        
-        for reloc_block in pe.relocations() {
-            for entry in &reloc_block.entries {
-                let target_rva = reloc_block.page_rva + entry.offset as u32;
-                let target_addr = unsafe {
-                    allocation.base().add(target_rva as usize)
-                };
-                
-                match entry.reloc_type {
-                    RelocationType::HighLow | RelocationType::Dir64 => {
-                        // Read current value
-                        let mut buffer = [0u8; 8];
-                        let size = if entry.reloc_type == RelocationType::Dir64 { 8 } else { 4 };
-                        process.read_memory(target_addr, &mut buffer[..size])?;
-                        
-                        // Apply delta
-                        if size == 8 {
-                            let value = i64::from_le_bytes(buffer);
-                            let new_value = value.wrapping_add(delta as i64);
-                            process.write_memory(target_addr as *mut _, &new_value.to_le_bytes())?;
-                        } else {
-                            let value = i32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-                            let new_value = value.wrapping_add(delta as i32);
-                            process.write_memory(target_addr as *mut _, &new_value.to_le_bytes())?;
-                        }
-                        
-                        count += 1;
-                    }
-                    RelocationType::Absolute => {
-                        // No-op, used for padding
-                    }
-                    _ => {
-                        // TODO: Handle other relocation types
-                    }
-                }
-            }
-        }
-        
-        Ok(count)
-    }
-    
-    fn resolve_imports(
-        &self,
-        process: &mut ProcessContext,
-        pe: &PeImage,
-        allocation: &RemoteAllocation,
-    ) -> Result<usize, MapperError> {
-        let mut count = 0;
-        
-        for import_desc in pe.imports() {
-            // Find or load the required module
-            let module = process.find_module(&import_desc.module_name)?
-                .ok_or(MapperError::ModuleNotFound(import_desc.module_name.clone()))?
-                .clone();
-            
-            for thunk in &import_desc.thunks {
-                let func_addr = self.resolve_export(process, &module, &thunk.name)?;
-                
-                let iat_entry = unsafe {
-                    allocation.base().add(thunk.iat_rva as usize)
-                };
-                
-                let addr_bytes = (func_addr as usize).to_le_bytes();
-                process.write_memory(iat_entry as *mut _, &addr_bytes)?;
-                
-                count += 1;
-            }
-        }
-        
-        Ok(count)
-    }
-    
-    fn resolve_export(
-        &self,
-        process: &ProcessContext,
-        module: &ModuleInfo,
-        name: &str,
-    ) -> Result<*const c_void, MapperError> {
-        // TODO: Parse remote module's export table
-        // For now, return a placeholder
-        Err(MapperError::ExportNotFound(name.to_string()))
-    }
-    
-    fn execute_tls_callbacks(
-        &self,
-        process: &ProcessContext,
-        pe: &PeImage,
-        allocation: &RemoteAllocation,
-    ) -> Result<usize, MapperError> {
-        let callbacks = pe.tls_callbacks();
-        
-        for (i, &callback_rva) in callbacks.iter().enumerate() {
-            if callback_rva == 0 {
-                break;
-            }
-            
-            let callback_addr = unsafe {
-                allocation.base().add(callback_rva as usize)
-            };
-            
-            // Execute TLS callback with DLL_PROCESS_ATTACH
-            self.strategy.execute(process, callback_addr, allocation.base())?;
-        }
-        
-        Ok(callbacks.len())
-    }
-    
-    fn apply_section_protections(
-        &self,
-        process: &ProcessContext,
-        pe: &PeImage,
-        allocation: &RemoteAllocation,
-    ) -> Result<(), MapperError> {
-        for section in pe.sections() {
-            let protection = MemoryProtection::from_section_characteristics(section.characteristics);
-            let section_addr = unsafe {
-                allocation.base().add(section.virtual_address as usize)
-            };
-            
-            process.protect(
-                section_addr as *mut _,
-                section.virtual_size as usize,
-                protection,
-            )?;
-        }
-        
-        Ok(())
-    }
-    
-    fn erase_pe_headers(
-        &self,
-        process: &ProcessContext,
-        allocation: &RemoteAllocation,
-        headers_size: usize,
-    ) -> Result<(), MapperError> {
-        let zeros = vec![0u8; headers_size];
-        process.write_memory(allocation.base(), &zeros)?;
-        Ok(())
-    }
-}
-
-impl Default for ManualMapper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Result of a successful mapping operation
-#[derive(Debug)]
-pub struct MappedImage {
-    pub base_address: *mut c_void,
-    pub size: usize,
-    pub entry_point: *const c_void,
-    pub exit_code: u32,
-}
-
-unsafe impl Send for MappedImage {}
-unsafe impl Sync for MappedImage {}
-```
-
-```rust
-// src/manualmapper/pe_parser.rs
-//! PE image parsing functionality
-
-use crate::error::MapperError;
-use std::ffi::c_void;
-
-/// Parsed PE image
-pub struct PeImage<'a> {
-    data: &'a [u8],
-    dos_header: DosHeader,
-    nt_headers: NtHeaders,
-    sections: Vec<SectionHeader>,
-    is_64bit: bool,
-}
-
-impl<'a> PeImage<'a> {
-    /// Parse a PE image from raw bytes
-    pub fn parse(data: &'a [u8]) -> Result<Self, MapperError> {
-        if data.len() < 64 {
-            return Err(MapperError::InvalidPeFormat("File too small".into()));
-        }
-        
-        // Parse DOS header
-        let dos_header = DosHeader::parse(data)?;
-        
-        if dos_header.e_magic != 0x5A4D {
-            return Err(MapperError::InvalidPeFormat("Invalid DOS signature".into()));
-        }
-        
-        let pe_offset = dos_header.e_lfanew as usize;
-        if pe_offset + 4 > data.len() {
-            return Err(MapperError::InvalidPeFormat("Invalid PE offset".into()));
-        }
-        
-        // Check PE signature
-        let pe_sig = u32::from_le_bytes([
-            data[pe_offset],
-            data[pe_offset + 1],
-            data[pe_offset + 2],
-            data[pe_offset + 3],
-        ]);
-        
-        if pe_sig != 0x00004550 {
-            return Err(MapperError::InvalidPeFormat("Invalid PE signature".into()));
-        }
-        
-        // Parse NT headers
-        let nt_headers = NtHeaders::parse(&data[pe_offset..])?;
-        let is_64bit = nt_headers.optional_header.magic == 0x20B;
-        
-        // Parse sections
-        let sections_offset = pe_offset + 24 + nt_headers.file_header.size_of_optional_header as usize;
-        let mut sections = Vec::with_capacity(nt_headers.file_header.number_of_sections as usize);
-        
-        for i in 0..nt_headers.file_header.number_of_sections as usize {
-            let section_offset = sections_offset + i * 40;
-            let section = SectionHeader::parse(&data[section_offset..])?;
-            sections.push(section);
-        }
-        
-        Ok(Self {
-            data,
-            dos_header,
-            nt_headers,
-            sections,
-            is_64bit,
-        })
-    }
-    
-    pub fn is_64bit(&self) -> bool {
-        self.is_64bit
-    }
-    
-    pub fn image_size(&self) -> usize {
-        self.nt_headers.optional_header.size_of_image as usize
-    }
-    
-    pub fn preferred_base(&self) -> *const c_void {
-        self.nt_headers.optional_header.image_base as *const c_void
-    }
-    
-    pub fn entry_point_rva(&self) -> usize {
-        self.nt_headers.optional_header.address_of_entry_point as usize
-    }
-    
-    pub fn headers_size(&self) -> usize {
-        self.nt_headers.optional_header.size_of_headers as usize
-    }
-    
-    pub fn headers_data(&self) -> &[u8] {
-        &self
