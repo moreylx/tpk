@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::any::TypeId;
+use std::time::{Duration, Instant};
 
 use crate::error::MapperError;
 
@@ -73,461 +74,652 @@ where
     }
 
     /// Check if a value satisfies all boundary conditions
-    pub fn check(&self, value: &T) -> BoundaryCheckResult {
-        // Check minimum boundary
+    pub fn check(&self, value: &T) -> bool {
         if let Some(ref min) = self.min {
             if value < min {
-                return BoundaryCheckResult::BelowMinimum;
+                return false;
             }
         }
-
-        // Check maximum boundary
         if let Some(ref max) = self.max {
             if value > max {
-                return BoundaryCheckResult::AboveMaximum;
+                return false;
             }
         }
-
-        // Check custom validator
         if let Some(ref validator) = self.validator {
             if !validator(value) {
-                return BoundaryCheckResult::ValidationFailed;
+                return false;
             }
         }
-
-        BoundaryCheckResult::Valid
+        true
     }
 
-    /// Returns true if the value is within bounds
-    pub fn is_valid(&self, value: &T) -> bool {
-        matches!(self.check(value), BoundaryCheckResult::Valid)
-    }
-}
-
-/// Result of a boundary condition check
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoundaryCheckResult {
-    /// Value is within all boundaries
-    Valid,
-    /// Value is below the minimum boundary
-    BelowMinimum,
-    /// Value is above the maximum boundary
-    AboveMaximum,
-    /// Value failed custom validation
-    ValidationFailed,
-}
-
-impl BoundaryCheckResult {
-    /// Returns true if the check passed
-    pub fn is_valid(&self) -> bool {
-        matches!(self, BoundaryCheckResult::Valid)
-    }
-
-    /// Convert to a MapperError if invalid
-    pub fn to_error(&self, context: &str) -> Option<MapperError> {
-        match self {
-            BoundaryCheckResult::Valid => None,
-            BoundaryCheckResult::BelowMinimum => {
-                Some(MapperError::ValidationError(format!(
-                    "{}: value below minimum boundary",
-                    context
-                )))
-            }
-            BoundaryCheckResult::AboveMaximum => {
-                Some(MapperError::ValidationError(format!(
-                    "{}: value above maximum boundary",
-                    context
-                )))
-            }
-            BoundaryCheckResult::ValidationFailed => {
-                Some(MapperError::ValidationError(format!(
-                    "{}: custom validation failed",
-                    context
-                )))
-            }
+    /// Validate and return error if boundary check fails
+    pub fn validate(&self, value: &T) -> TransformResult<()> {
+        if self.check(value) {
+            Ok(())
+        } else {
+            Err(MapperError::ValidationFailed("Boundary condition violated".into()))
         }
     }
 }
 
-/// Trait defining a transformation strategy
+/// Strategy trait for transformation operations
 pub trait TransformStrategy<I, O>: Send + Sync {
     /// Transform input to output
     fn transform(&self, input: I) -> TransformResult<O>;
     
-    /// Get the name of this transformation strategy
-    fn name(&self) -> &str;
-    
-    /// Check if this strategy can handle the given input
-    fn can_transform(&self, input: &I) -> bool;
+    /// Get strategy identifier for caching
+    fn strategy_id(&self) -> &str;
 }
 
-/// A bounded transformation strategy that validates input before transformation
-pub struct BoundedStrategy<I, O, S>
-where
-    S: TransformStrategy<I, O>,
-{
-    inner: S,
-    input_bounds: BoundaryCondition<I>,
-    output_bounds: Option<BoundaryCondition<O>>,
-    _phantom: PhantomData<(I, O)>,
+/// Performance metrics for transformation operations
+#[derive(Debug, Clone, Default)]
+pub struct TransformMetrics {
+    pub total_transforms: u64,
+    pub successful_transforms: u64,
+    pub failed_transforms: u64,
+    pub total_duration_ns: u64,
+    pub min_duration_ns: u64,
+    pub max_duration_ns: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
-impl<I, O, S> BoundedStrategy<I, O, S>
-where
-    I: PartialOrd + Clone,
-    O: PartialOrd + Clone,
-    S: TransformStrategy<I, O>,
-{
-    /// Create a new bounded strategy wrapping an existing strategy
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            input_bounds: BoundaryCondition::default(),
-            output_bounds: None,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Set input boundary conditions
-    pub fn with_input_bounds(mut self, bounds: BoundaryCondition<I>) -> Self {
-        self.input_bounds = bounds;
-        self
-    }
-
-    /// Set output boundary conditions
-    pub fn with_output_bounds(mut self, bounds: BoundaryCondition<O>) -> Self {
-        self.output_bounds = Some(bounds);
-        self
-    }
-}
-
-impl<I, O, S> TransformStrategy<I, O> for BoundedStrategy<I, O, S>
-where
-    I: PartialOrd + Clone + Send + Sync,
-    O: PartialOrd + Clone + Send + Sync,
-    S: TransformStrategy<I, O>,
-{
-    fn transform(&self, input: I) -> TransformResult<O> {
-        // Check input boundaries
-        let input_check = self.input_bounds.check(&input);
-        if let Some(err) = input_check.to_error(&format!("{}::input", self.name())) {
-            return Err(err);
-        }
-
-        // Perform the transformation
-        let output = self.inner.transform(input)?;
-
-        // Check output boundaries if configured
-        if let Some(ref output_bounds) = self.output_bounds {
-            let output_check = output_bounds.check(&output);
-            if let Some(err) = output_check.to_error(&format!("{}::output", self.name())) {
-                return Err(err);
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn can_transform(&self, input: &I) -> bool {
-        self.input_bounds.is_valid(input) && self.inner.can_transform(input)
-    }
-}
-
-/// A composable transformer that chains multiple transformations
-pub struct TransformPipeline<I, O> {
-    stages: Vec<Box<dyn TransformStrategy<I, O>>>,
-    fallback: Option<Box<dyn TransformStrategy<I, O>>>,
-    global_input_bounds: Option<BoundaryCondition<I>>,
-    _phantom: PhantomData<(I, O)>,
-}
-
-impl<I, O> TransformPipeline<I, O>
-where
-    I: Clone + PartialOrd + Send + Sync + 'static,
-    O: Send + Sync + 'static,
-{
-    /// Create a new empty pipeline
+impl TransformMetrics {
     pub fn new() -> Self {
         Self {
-            stages: Vec::new(),
-            fallback: None,
-            global_input_bounds: None,
-            _phantom: PhantomData,
+            min_duration_ns: u64::MAX,
+            ..Default::default()
         }
     }
 
-    /// Add a transformation stage to the pipeline
-    pub fn add_stage<S>(mut self, strategy: S) -> Self
-    where
-        S: TransformStrategy<I, O> + 'static,
-    {
-        self.stages.push(Box::new(strategy));
-        self
+    #[inline]
+    pub fn record_success(&mut self, duration_ns: u64) {
+        self.total_transforms += 1;
+        self.successful_transforms += 1;
+        self.total_duration_ns = self.total_duration_ns.saturating_add(duration_ns);
+        self.min_duration_ns = self.min_duration_ns.min(duration_ns);
+        self.max_duration_ns = self.max_duration_ns.max(duration_ns);
     }
 
-    /// Set a fallback strategy when no other strategy matches
-    pub fn with_fallback<S>(mut self, strategy: S) -> Self
-    where
-        S: TransformStrategy<I, O> + 'static,
-    {
-        self.fallback = Some(Box::new(strategy));
-        self
+    #[inline]
+    pub fn record_failure(&mut self) {
+        self.total_transforms += 1;
+        self.failed_transforms += 1;
     }
 
-    /// Set global input boundary conditions that apply before any stage
-    pub fn with_global_input_bounds(mut self, bounds: BoundaryCondition<I>) -> Self {
-        self.global_input_bounds = Some(bounds);
-        self
+    #[inline]
+    pub fn record_cache_hit(&mut self) {
+        self.cache_hits += 1;
     }
 
-    /// Execute the pipeline, trying each stage until one succeeds
-    pub fn execute(&self, input: I) -> TransformResult<O> {
-        // Check global input boundaries first
-        if let Some(ref bounds) = self.global_input_bounds {
-            let check = bounds.check(&input);
-            if let Some(err) = check.to_error("pipeline::global_input") {
-                return Err(err);
-            }
+    #[inline]
+    pub fn record_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    pub fn average_duration_ns(&self) -> u64 {
+        if self.successful_transforms == 0 {
+            0
+        } else {
+            self.total_duration_ns / self.successful_transforms
         }
-
-        // Try each stage in order
-        for stage in &self.stages {
-            if stage.can_transform(&input) {
-                match stage.transform(input.clone()) {
-                    Ok(output) => return Ok(output),
-                    Err(e) => {
-                        // Log error and continue to next stage
-                        log::debug!(
-                            "Stage '{}' failed with error: {:?}, trying next stage",
-                            stage.name(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Try fallback if available
-        if let Some(ref fallback) = self.fallback {
-            return fallback.transform(input);
-        }
-
-        Err(MapperError::TransformError(
-            "No suitable transformation strategy found".to_string(),
-        ))
     }
 
-    /// Get the number of stages in the pipeline
-    pub fn stage_count(&self) -> usize {
-        self.stages.len()
-    }
-
-    /// Check if the pipeline has a fallback strategy
-    pub fn has_fallback(&self) -> bool {
-        self.fallback.is_some()
-    }
-
-    /// Validate input against global bounds without executing transformation
-    pub fn validate_input(&self, input: &I) -> BoundaryCheckResult {
-        match &self.global_input_bounds {
-            Some(bounds) => bounds.check(input),
-            None => BoundaryCheckResult::Valid,
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.cache_hits as f64 / total as f64
         }
     }
 }
 
-impl<I, O> Default for TransformPipeline<I, O>
-where
-    I: Clone + PartialOrd + Send + Sync + 'static,
-    O: Send + Sync + 'static,
-{
-    fn default() -> Self {
-        Self::new()
-    }
+/// Cache entry with expiration tracking
+struct CacheEntry<T> {
+    value: T,
+    created_at: Instant,
+    access_count: u32,
 }
 
-/// A registry for managing multiple transformation pipelines
-pub struct TransformRegistry<I, O> {
-    pipelines: RwLock<HashMap<String, Arc<TransformPipeline<I, O>>>>,
-    default_pipeline: RwLock<Option<String>>,
-}
-
-impl<I, O> TransformRegistry<I, O>
-where
-    I: Clone + PartialOrd + Send + Sync + 'static,
-    O: Send + Sync + 'static,
-{
-    /// Create a new empty registry
-    pub fn new() -> Self {
+impl<T: Clone> CacheEntry<T> {
+    fn new(value: T) -> Self {
         Self {
-            pipelines: RwLock::new(HashMap::new()),
-            default_pipeline: RwLock::new(None),
+            value,
+            created_at: Instant::now(),
+            access_count: 0,
         }
     }
 
-    /// Register a pipeline with a given name
-    pub fn register(&self, name: impl Into<String>, pipeline: TransformPipeline<I, O>) -> TransformResult<()> {
-        let name = name.into();
-        let mut pipelines = self.pipelines.write().map_err(|_| {
-            MapperError::LockError("Failed to acquire write lock on pipelines".to_string())
-        })?;
-        pipelines.insert(name, Arc::new(pipeline));
-        Ok(())
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.created_at.elapsed() > ttl
     }
 
-    /// Set the default pipeline by name
-    pub fn set_default(&self, name: impl Into<String>) -> TransformResult<()> {
-        let name = name.into();
-        
-        // Verify pipeline exists
-        let pipelines = self.pipelines.read().map_err(|_| {
-            MapperError::LockError("Failed to acquire read lock on pipelines".to_string())
-        })?;
-        
-        if !pipelines.contains_key(&name) {
-            return Err(MapperError::NotFound(format!(
-                "Pipeline '{}' not found in registry",
-                name
-            )));
-        }
-        drop(pipelines);
-
-        let mut default = self.default_pipeline.write().map_err(|_| {
-            MapperError::LockError("Failed to acquire write lock on default pipeline".to_string())
-        })?;
-        *default = Some(name);
-        Ok(())
-    }
-
-    /// Get a pipeline by name
-    pub fn get(&self, name: &str) -> TransformResult<Arc<TransformPipeline<I, O>>> {
-        let pipelines = self.pipelines.read().map_err(|_| {
-            MapperError::LockError("Failed to acquire read lock on pipelines".to_string())
-        })?;
-        
-        pipelines.get(name).cloned().ok_or_else(|| {
-            MapperError::NotFound(format!("Pipeline '{}' not found", name))
-        })
-    }
-
-    /// Get the default pipeline
-    pub fn get_default(&self) -> TransformResult<Arc<TransformPipeline<I, O>>> {
-        let default = self.default_pipeline.read().map_err(|_| {
-            MapperError::LockError("Failed to acquire read lock on default pipeline".to_string())
-        })?;
-        
-        match default.as_ref() {
-            Some(name) => self.get(name),
-            None => Err(MapperError::NotFound("No default pipeline configured".to_string())),
-        }
-    }
-
-    /// Execute transformation using the default pipeline
-    pub fn transform(&self, input: I) -> TransformResult<O> {
-        let pipeline = self.get_default()?;
-        pipeline.execute(input)
-    }
-
-    /// Execute transformation using a named pipeline
-    pub fn transform_with(&self, name: &str, input: I) -> TransformResult<O> {
-        let pipeline = self.get(name)?;
-        pipeline.execute(input)
-    }
-
-    /// List all registered pipeline names
-    pub fn list_pipelines(&self) -> TransformResult<Vec<String>> {
-        let pipelines = self.pipelines.read().map_err(|_| {
-            MapperError::LockError("Failed to acquire read lock on pipelines".to_string())
-        })?;
-        Ok(pipelines.keys().cloned().collect())
+    fn access(&mut self) -> &T {
+        self.access_count += 1;
+        &self.value
     }
 }
 
-impl<I, O> Default for TransformRegistry<I, O>
+/// High-performance LRU cache with TTL support
+pub struct TransformCache<K, V> {
+    entries: HashMap<K, CacheEntry<V>>,
+    capacity: usize,
+    ttl: Duration,
+    eviction_threshold: usize,
+}
+
+impl<K, V> TransformCache<K, V>
 where
-    I: Clone + PartialOrd + Send + Sync + 'static,
-    O: Send + Sync + 'static,
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Identity transformation that returns input unchanged
-pub struct IdentityTransform<T> {
-    name: String,
-    _phantom: PhantomData<T>,
-}
-
-impl<T> IdentityTransform<T> {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            name: name.into(),
-            _phantom: PhantomData,
+            entries: HashMap::with_capacity(capacity),
+            capacity,
+            ttl,
+            eviction_threshold: capacity * 3 / 4,
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        if let Some(entry) = self.entries.get_mut(key) {
+            if entry.is_expired(self.ttl) {
+                self.entries.remove(key);
+                return None;
+            }
+            Some(entry.access().clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.entries.len() >= self.capacity {
+            self.evict_expired();
+        }
+        if self.entries.len() >= self.capacity {
+            self.evict_lru();
+        }
+        self.entries.insert(key, CacheEntry::new(value));
+    }
+
+    fn evict_expired(&mut self) {
+        self.entries.retain(|_, entry| !entry.is_expired(self.ttl));
+    }
+
+    fn evict_lru(&mut self) {
+        if self.entries.len() <= self.eviction_threshold {
+            return;
+        }
+
+        let mut entries_by_access: Vec<_> = self.entries.iter()
+            .map(|(k, v)| (k.clone(), v.access_count))
+            .collect();
+        
+        entries_by_access.sort_by_key(|(_, count)| *count);
+        
+        let to_remove = self.entries.len() - self.eviction_threshold;
+        for (key, _) in entries_by_access.into_iter().take(to_remove) {
+            self.entries.remove(&key);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Support ticket priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupportPriority {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl SupportPriority {
+    fn weight(&self) -> u32 {
+        match self {
+            SupportPriority::Critical => 1000,
+            SupportPriority::High => 100,
+            SupportPriority::Medium => 10,
+            SupportPriority::Low => 1,
         }
     }
 }
 
-impl<T> TransformStrategy<T, T> for IdentityTransform<T>
-where
-    T: Clone + Send + Sync,
-{
-    fn transform(&self, input: T) -> TransformResult<T> {
-        Ok(input)
-    }
+/// Support request data structure
+#[derive(Debug, Clone)]
+pub struct SupportRequest {
+    pub id: u64,
+    pub priority: SupportPriority,
+    pub category: String,
+    pub payload: Vec<u8>,
+    pub timestamp: Instant,
+}
 
-    fn name(&self) -> &str {
-        &self.name
-    }
+/// Processed support response
+#[derive(Debug, Clone)]
+pub struct SupportResponse {
+    pub request_id: u64,
+    pub status: SupportStatus,
+    pub result: Option<Vec<u8>>,
+    pub processing_time_ns: u64,
+}
 
-    fn can_transform(&self, _input: &T) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportStatus {
+    Completed,
+    Pending,
+    Failed,
+    Cached,
+}
+
+/// Handler trait for support request processing
+pub trait SupportHandler: Send + Sync {
+    fn handle(&self, request: &SupportRequest) -> TransformResult<Vec<u8>>;
+    fn category(&self) -> &str;
+    fn supports_caching(&self) -> bool {
         true
     }
 }
 
-/// Mapping transformation using a closure
-pub struct MapTransform<I, O, F>
-where
-    F: Fn(I) -> TransformResult<O> + Send + Sync,
-{
-    name: String,
-    mapper: F,
+/// Optimized support manager with batching and priority queuing
+pub struct SupportManager {
+    handlers: RwLock<HashMap<String, Arc<dyn SupportHandler>>>,
+    metrics: RwLock<HashMap<String, TransformMetrics>>,
+    response_cache: RwLock<TransformCache<u64, SupportResponse>>,
+    batch_size: usize,
+    enable_metrics: bool,
+    priority_weights: [u32; 4],
+}
+
+impl SupportManager {
+    /// Create a new support manager with default configuration
+    pub fn new() -> Self {
+        Self {
+            handlers: RwLock::new(HashMap::new()),
+            metrics: RwLock::new(HashMap::new()),
+            response_cache: RwLock::new(TransformCache::new(1024, Duration::from_secs(300))),
+            batch_size: 64,
+            enable_metrics: true,
+            priority_weights: [1000, 100, 10, 1],
+        }
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(cache_capacity: usize, cache_ttl: Duration, batch_size: usize) -> Self {
+        Self {
+            handlers: RwLock::new(HashMap::new()),
+            metrics: RwLock::new(HashMap::new()),
+            response_cache: RwLock::new(TransformCache::new(cache_capacity, cache_ttl)),
+            batch_size,
+            enable_metrics: true,
+            priority_weights: [1000, 100, 10, 1],
+        }
+    }
+
+    /// Register a handler for a specific category
+    pub fn register_handler<H: SupportHandler + 'static>(&self, handler: H) -> TransformResult<()> {
+        let category = handler.category().to_string();
+        let mut handlers = self.handlers.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire handlers write lock".into())
+        })?;
+        
+        handlers.insert(category.clone(), Arc::new(handler));
+        
+        if self.enable_metrics {
+            let mut metrics = self.metrics.write().map_err(|_| {
+                MapperError::LockError("Failed to acquire metrics write lock".into())
+            })?;
+            metrics.insert(category, TransformMetrics::new());
+        }
+        
+        Ok(())
+    }
+
+    /// Process a single support request with caching
+    #[inline]
+    pub fn process(&self, request: &SupportRequest) -> TransformResult<SupportResponse> {
+        // Check cache first
+        {
+            let mut cache = self.response_cache.write().map_err(|_| {
+                MapperError::LockError("Failed to acquire cache write lock".into())
+            })?;
+            
+            if let Some(cached) = cache.get(&request.id) {
+                if self.enable_metrics {
+                    self.record_cache_hit(&request.category)?;
+                }
+                return Ok(SupportResponse {
+                    status: SupportStatus::Cached,
+                    ..cached
+                });
+            }
+        }
+
+        if self.enable_metrics {
+            self.record_cache_miss(&request.category)?;
+        }
+
+        let start = Instant::now();
+        let result = self.execute_handler(request);
+        let duration_ns = start.elapsed().as_nanos() as u64;
+
+        let response = match result {
+            Ok(data) => {
+                if self.enable_metrics {
+                    self.record_success(&request.category, duration_ns)?;
+                }
+                SupportResponse {
+                    request_id: request.id,
+                    status: SupportStatus::Completed,
+                    result: Some(data),
+                    processing_time_ns: duration_ns,
+                }
+            }
+            Err(e) => {
+                if self.enable_metrics {
+                    self.record_failure(&request.category)?;
+                }
+                return Err(e);
+            }
+        };
+
+        // Cache the response if handler supports it
+        if self.should_cache(&request.category)? {
+            let mut cache = self.response_cache.write().map_err(|_| {
+                MapperError::LockError("Failed to acquire cache write lock".into())
+            })?;
+            cache.insert(request.id, response.clone());
+        }
+
+        Ok(response)
+    }
+
+    /// Process multiple requests in batch with priority ordering
+    pub fn process_batch(&self, mut requests: Vec<SupportRequest>) -> Vec<TransformResult<SupportResponse>> {
+        // Sort by priority weight (higher weight = higher priority)
+        requests.sort_by(|a, b| {
+            b.priority.weight().cmp(&a.priority.weight())
+        });
+
+        let mut results = Vec::with_capacity(requests.len());
+        
+        for chunk in requests.chunks(self.batch_size) {
+            for request in chunk {
+                results.push(self.process(request));
+            }
+        }
+
+        results
+    }
+
+    /// Process requests with parallel execution for independent categories
+    #[cfg(feature = "parallel")]
+    pub fn process_parallel(&self, requests: Vec<SupportRequest>) -> Vec<TransformResult<SupportResponse>> {
+        use rayon::prelude::*;
+        
+        let mut sorted_requests = requests;
+        sorted_requests.sort_by(|a, b| b.priority.weight().cmp(&a.priority.weight()));
+        
+        sorted_requests
+            .par_iter()
+            .map(|req| self.process(req))
+            .collect()
+    }
+
+    #[inline]
+    fn execute_handler(&self, request: &SupportRequest) -> TransformResult<Vec<u8>> {
+        let handlers = self.handlers.read().map_err(|_| {
+            MapperError::LockError("Failed to acquire handlers read lock".into())
+        })?;
+
+        let handler = handlers.get(&request.category).ok_or_else(|| {
+            MapperError::NotFound(format!("No handler for category: {}", request.category))
+        })?;
+
+        handler.handle(request)
+    }
+
+    fn should_cache(&self, category: &str) -> TransformResult<bool> {
+        let handlers = self.handlers.read().map_err(|_| {
+            MapperError::LockError("Failed to acquire handlers read lock".into())
+        })?;
+
+        Ok(handlers
+            .get(category)
+            .map(|h| h.supports_caching())
+            .unwrap_or(false))
+    }
+
+    #[inline]
+    fn record_success(&self, category: &str, duration_ns: u64) -> TransformResult<()> {
+        let mut metrics = self.metrics.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics write lock".into())
+        })?;
+        
+        if let Some(m) = metrics.get_mut(category) {
+            m.record_success(duration_ns);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn record_failure(&self, category: &str) -> TransformResult<()> {
+        let mut metrics = self.metrics.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics write lock".into())
+        })?;
+        
+        if let Some(m) = metrics.get_mut(category) {
+            m.record_failure();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn record_cache_hit(&self, category: &str) -> TransformResult<()> {
+        let mut metrics = self.metrics.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics write lock".into())
+        })?;
+        
+        if let Some(m) = metrics.get_mut(category) {
+            m.record_cache_hit();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn record_cache_miss(&self, category: &str) -> TransformResult<()> {
+        let mut metrics = self.metrics.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics write lock".into())
+        })?;
+        
+        if let Some(m) = metrics.get_mut(category) {
+            m.record_cache_miss();
+        }
+        Ok(())
+    }
+
+    /// Get metrics for a specific category
+    pub fn get_metrics(&self, category: &str) -> TransformResult<Option<TransformMetrics>> {
+        let metrics = self.metrics.read().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics read lock".into())
+        })?;
+        
+        Ok(metrics.get(category).cloned())
+    }
+
+    /// Get aggregated metrics across all categories
+    pub fn get_aggregate_metrics(&self) -> TransformResult<TransformMetrics> {
+        let metrics = self.metrics.read().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics read lock".into())
+        })?;
+
+        let mut aggregate = TransformMetrics::new();
+        
+        for m in metrics.values() {
+            aggregate.total_transforms += m.total_transforms;
+            aggregate.successful_transforms += m.successful_transforms;
+            aggregate.failed_transforms += m.failed_transforms;
+            aggregate.total_duration_ns = aggregate.total_duration_ns.saturating_add(m.total_duration_ns);
+            aggregate.min_duration_ns = aggregate.min_duration_ns.min(m.min_duration_ns);
+            aggregate.max_duration_ns = aggregate.max_duration_ns.max(m.max_duration_ns);
+            aggregate.cache_hits += m.cache_hits;
+            aggregate.cache_misses += m.cache_misses;
+        }
+
+        Ok(aggregate)
+    }
+
+    /// Clear all caches
+    pub fn clear_cache(&self) -> TransformResult<()> {
+        let mut cache = self.response_cache.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire cache write lock".into())
+        })?;
+        cache.clear();
+        Ok(())
+    }
+
+    /// Reset all metrics
+    pub fn reset_metrics(&self) -> TransformResult<()> {
+        let mut metrics = self.metrics.write().map_err(|_| {
+            MapperError::LockError("Failed to acquire metrics write lock".into())
+        })?;
+        
+        for m in metrics.values_mut() {
+            *m = TransformMetrics::new();
+        }
+        Ok(())
+    }
+
+    /// Get current cache size
+    pub fn cache_size(&self) -> TransformResult<usize> {
+        let cache = self.response_cache.read().map_err(|_| {
+            MapperError::LockError("Failed to acquire cache read lock".into())
+        })?;
+        Ok(cache.len())
+    }
+}
+
+impl Default for SupportManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Transformer pipeline for chaining multiple transformations
+pub struct TransformPipeline<I, O> {
+    stages: Vec<Box<dyn Fn(I) -> TransformResult<O> + Send + Sync>>,
     _phantom: PhantomData<(I, O)>,
 }
 
-impl<I, O, F> MapTransform<I, O, F>
+impl<T> TransformPipeline<T, T>
+where
+    T: Clone + Send + 'static,
+{
+    pub fn new() -> Self {
+        Self {
+            stages: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn add_stage<F>(mut self, stage: F) -> Self
+    where
+        F: Fn(T) -> TransformResult<T> + Send + Sync + 'static,
+    {
+        self.stages.push(Box::new(stage));
+        self
+    }
+
+    pub fn execute(&self, input: T) -> TransformResult<T> {
+        let mut current = input;
+        for stage in &self.stages {
+            current = stage(current)?;
+        }
+        Ok(current)
+    }
+}
+
+impl<T: Clone + Send + 'static> Default for TransformPipeline<T, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Identity transformation strategy
+pub struct IdentityStrategy<T> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T> IdentityStrategy<T> {
+    pub fn new() -> Self {
+        Self { _phantom: PhantomData }
+    }
+}
+
+impl<T> Default for IdentityStrategy<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone + Send + Sync> TransformStrategy<T, T> for IdentityStrategy<T> {
+    fn transform(&self, input: T) -> TransformResult<T> {
+        Ok(input)
+    }
+
+    fn strategy_id(&self) -> &str {
+        "identity"
+    }
+}
+
+/// Mapping transformation strategy
+pub struct MappingStrategy<I, O, F>
 where
     F: Fn(I) -> TransformResult<O> + Send + Sync,
 {
-    pub fn new(name: impl Into<String>, mapper: F) -> Self {
+    mapper: F,
+    id: String,
+    _phantom: PhantomData<(I, O)>,
+}
+
+impl<I, O, F> MappingStrategy<I, O, F>
+where
+    F: Fn(I) -> TransformResult<O> + Send + Sync,
+{
+    pub fn new(id: impl Into<String>, mapper: F) -> Self {
         Self {
-            name: name.into(),
             mapper,
+            id: id.into(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<I, O, F> TransformStrategy<I, O> for MapTransform<I, O, F>
+impl<I, O, F> TransformStrategy<I, O> for MappingStrategy<I, O, F>
 where
-    I: Send + Sync,
-    O: Send + Sync,
     F: Fn(I) -> TransformResult<O> + Send + Sync,
 {
     fn transform(&self, input: I) -> TransformResult<O> {
         (self.mapper)(input)
     }
 
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn can_transform(&self, _input: &I) -> bool {
-        true
+    fn strategy_id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -537,68 +729,75 @@ mod tests {
 
     #[test]
     fn test_boundary_condition_range() {
-        let bounds = BoundaryCondition::new()
-            .with_min(0i32)
-            .with_max(100i32);
-
-        assert!(bounds.is_valid(&50));
-        assert!(bounds.is_valid(&0));
-        assert!(bounds.is_valid(&100));
-        assert!(!bounds.is_valid(&-1));
-        assert!(!bounds.is_valid(&101));
+        let boundary = BoundaryCondition::new()
+            .with_range(0i32, 100);
+        
+        assert!(boundary.check(&50));
+        assert!(boundary.check(&0));
+        assert!(boundary.check(&100));
+        assert!(!boundary.check(&-1));
+        assert!(!boundary.check(&101));
     }
 
     #[test]
-    fn test_boundary_condition_custom_validator() {
-        let bounds = BoundaryCondition::<i32>::new()
-            .with_validator(|v| v % 2 == 0);
-
-        assert!(bounds.is_valid(&2));
-        assert!(bounds.is_valid(&0));
-        assert!(!bounds.is_valid(&1));
-        assert!(!bounds.is_valid(&3));
+    fn test_boundary_condition_validator() {
+        let boundary = BoundaryCondition::new()
+            .with_validator(|x: &i32| x % 2 == 0);
+        
+        assert!(boundary.check(&2));
+        assert!(boundary.check(&0));
+        assert!(!boundary.check(&1));
     }
 
     #[test]
-    fn test_boundary_check_result() {
-        assert!(BoundaryCheckResult::Valid.is_valid());
-        assert!(!BoundaryCheckResult::BelowMinimum.is_valid());
-        assert!(!BoundaryCheckResult::AboveMaximum.is_valid());
-        assert!(!BoundaryCheckResult::ValidationFailed.is_valid());
+    fn test_transform_cache() {
+        let mut cache: TransformCache<u64, String> = TransformCache::new(10, Duration::from_secs(60));
+        
+        cache.insert(1, "one".to_string());
+        cache.insert(2, "two".to_string());
+        
+        assert_eq!(cache.get(&1), Some("one".to_string()));
+        assert_eq!(cache.get(&2), Some("two".to_string()));
+        assert_eq!(cache.get(&3), None);
     }
 
     #[test]
-    fn test_identity_transform() {
-        let transform = IdentityTransform::<i32>::new("identity");
-        assert_eq!(transform.transform(42).unwrap(), 42);
-        assert_eq!(transform.name(), "identity");
+    fn test_transform_metrics() {
+        let mut metrics = TransformMetrics::new();
+        
+        metrics.record_success(100);
+        metrics.record_success(200);
+        metrics.record_failure();
+        metrics.record_cache_hit();
+        metrics.record_cache_miss();
+        
+        assert_eq!(metrics.total_transforms, 3);
+        assert_eq!(metrics.successful_transforms, 2);
+        assert_eq!(metrics.failed_transforms, 1);
+        assert_eq!(metrics.average_duration_ns(), 150);
+        assert!((metrics.cache_hit_ratio() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_map_transform() {
-        let transform = MapTransform::new("double", |x: i32| Ok(x * 2));
-        assert_eq!(transform.transform(21).unwrap(), 42);
+    fn test_identity_strategy() {
+        let strategy = IdentityStrategy::<i32>::new();
+        assert_eq!(strategy.transform(42).unwrap(), 42);
+        assert_eq!(strategy.strategy_id(), "identity");
     }
 
     #[test]
-    fn test_bounded_strategy() {
-        let inner = MapTransform::new("double", |x: i32| Ok(x * 2));
-        let bounded = BoundedStrategy::new(inner)
-            .with_input_bounds(BoundaryCondition::new().with_range(0, 50))
-            .with_output_bounds(BoundaryCondition::new().with_max(100));
-
-        assert_eq!(bounded.transform(25).unwrap(), 50);
-        assert!(bounded.transform(51).is_err()); // Input out of bounds
+    fn test_mapping_strategy() {
+        let strategy = MappingStrategy::new("double", |x: i32| Ok(x * 2));
+        assert_eq!(strategy.transform(21).unwrap(), 42);
+        assert_eq!(strategy.strategy_id(), "double");
     }
 
     #[test]
-    fn test_pipeline_with_global_bounds() {
+    fn test_transform_pipeline() {
         let pipeline = TransformPipeline::<i32, i32>::new()
-            .with_global_input_bounds(BoundaryCondition::new().with_range(0, 100))
-            .add_stage(IdentityTransform::new("identity"));
-
-        assert_eq!(pipeline.execute(50).unwrap(), 50);
-        assert!(pipeline.execute(-1).is_err());
-        assert!(pipeline.execute(101).is_err());
+            .add_stage(|x| Ok(x + 1))
+            .add_stage(|x| Ok(x * 2));
+        
+        assert_eq!(pipeline.execute(5).unwrap(), 12);
     }
 }
