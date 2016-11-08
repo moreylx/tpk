@@ -2,12 +2,20 @@
 //! 
 //! Provides RAII-based memory management with automatic cleanup,
 //! memory protection utilities, and safe abstractions over raw memory operations.
+//! 
+//! # Performance Optimizations
+//! - Lock-free allocation tracking using atomic operations
+//! - Memory pooling for frequently allocated sizes
+//! - Cache-aligned allocations for hot data structures
+//! - Batch allocation support for bulk operations
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
+use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::fmt;
 
 use crate::error::{MapperError, NtStatus};
@@ -15,6 +23,16 @@ use crate::error::{MapperError, NtStatus};
 /// Global memory allocation tracker for debugging and leak detection
 static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Cache line size for alignment optimization
+const CACHE_LINE_SIZE: usize = 64;
+
+/// Small allocation threshold for pool usage
+const SMALL_ALLOC_THRESHOLD: usize = 256;
+
+/// Number of size classes in the memory pool
+const POOL_SIZE_CLASSES: usize = 8;
 
 /// Memory protection flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,296 +101,580 @@ impl MemoryProtection {
             _ => None,
         }
     }
-}
 
-/// Memory allocation strategy trait for the Strategy pattern
-pub trait AllocationStrategy {
-    /// Allocate memory with the given layout
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, MapperError>;
-    
-    /// Deallocate memory previously allocated
-    fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
-    
-    /// Reallocate memory to a new size
-    fn reallocate(&self, ptr: NonNull<u8>, old_layout: Layout, new_size: usize) -> Result<NonNull<u8>, MapperError>;
-    
-    /// Returns true if this strategy zero-initializes memory
-    fn zeroes_memory(&self) -> bool;
-}
-
-/// Standard heap allocation strategy
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HeapStrategy;
-
-impl AllocationStrategy for HeapStrategy {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, MapperError> {
-        if layout.size() == 0 {
-            return Err(MapperError::InvalidParameter("Cannot allocate zero-sized memory".into()));
-        }
-        
-        let ptr = unsafe { alloc(layout) };
-        NonNull::new(ptr).ok_or_else(|| {
-            MapperError::AllocationFailed {
-                size: layout.size(),
-                reason: "System allocator returned null".into(),
-            }
-        })
-    }
-    
-    fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe { dealloc(ptr.as_ptr(), layout) }
-    }
-    
-    fn reallocate(&self, ptr: NonNull<u8>, old_layout: Layout, new_size: usize) -> Result<NonNull<u8>, MapperError> {
-        if new_size == 0 {
-            self.deallocate(ptr, old_layout);
-            return Err(MapperError::InvalidParameter("Cannot reallocate to zero size".into()));
-        }
-        
-        let new_ptr = unsafe { realloc(ptr.as_ptr(), old_layout, new_size) };
-        NonNull::new(new_ptr).ok_or_else(|| {
-            MapperError::AllocationFailed {
-                size: new_size,
-                reason: "Reallocation failed".into(),
-            }
-        })
-    }
-    
-    fn zeroes_memory(&self) -> bool {
-        false
+    /// Convert to raw Windows protection constant
+    #[inline]
+    pub fn to_raw(self) -> u32 {
+        self as u32
     }
 }
 
-/// Zero-initialized heap allocation strategy
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ZeroedHeapStrategy;
+/// Memory allocation statistics for performance monitoring
+#[derive(Debug, Clone, Copy)]
+pub struct AllocationStats {
+    pub current_count: usize,
+    pub total_bytes: usize,
+    pub peak_bytes: usize,
+    pub pool_hits: usize,
+    pub pool_misses: usize,
+}
 
-impl AllocationStrategy for ZeroedHeapStrategy {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, MapperError> {
-        if layout.size() == 0 {
-            return Err(MapperError::InvalidParameter("Cannot allocate zero-sized memory".into()));
+impl AllocationStats {
+    /// Capture current allocation statistics
+    pub fn capture() -> Self {
+        Self {
+            current_count: ALLOCATION_COUNT.load(Ordering::Relaxed),
+            total_bytes: TOTAL_ALLOCATED_BYTES.load(Ordering::Relaxed),
+            peak_bytes: PEAK_ALLOCATED_BYTES.load(Ordering::Relaxed),
+            pool_hits: POOL_STATS.hits.load(Ordering::Relaxed),
+            pool_misses: POOL_STATS.misses.load(Ordering::Relaxed),
         }
-        
-        let ptr = unsafe { alloc_zeroed(layout) };
-        NonNull::new(ptr).ok_or_else(|| {
-            MapperError::AllocationFailed {
-                size: layout.size(),
-                reason: "System allocator returned null".into(),
-            }
-        })
-    }
-    
-    fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe { dealloc(ptr.as_ptr(), layout) }
-    }
-    
-    fn reallocate(&self, ptr: NonNull<u8>, old_layout: Layout, new_size: usize) -> Result<NonNull<u8>, MapperError> {
-        if new_size == 0 {
-            self.deallocate(ptr, old_layout);
-            return Err(MapperError::InvalidParameter("Cannot reallocate to zero size".into()));
-        }
-        
-        let new_ptr = unsafe { realloc(ptr.as_ptr(), old_layout, new_size) };
-        if let Some(valid_ptr) = NonNull::new(new_ptr) {
-            // Zero out the new portion if we grew
-            if new_size > old_layout.size() {
-                unsafe {
-                    std::ptr::write_bytes(
-                        valid_ptr.as_ptr().add(old_layout.size()),
-                        0,
-                        new_size - old_layout.size(),
-                    );
-                }
-            }
-            Ok(valid_ptr)
-        } else {
-            Err(MapperError::AllocationFailed {
-                size: new_size,
-                reason: "Reallocation failed".into(),
-            })
-        }
-    }
-    
-    fn zeroes_memory(&self) -> bool {
-        true
     }
 }
 
-/// RAII-based safe memory buffer with automatic cleanup
-pub struct SafeBuffer<T, S: AllocationStrategy = HeapStrategy> {
+/// Pool statistics tracking
+struct PoolStats {
+    hits: AtomicUsize,
+    misses: AtomicUsize,
+}
+
+static POOL_STATS: PoolStats = PoolStats {
+    hits: AtomicUsize::new(0),
+    misses: AtomicUsize::new(0),
+};
+
+/// Lock-free memory pool node
+struct PoolNode {
+    next: AtomicPtr<PoolNode>,
+}
+
+/// Lock-free memory pool for small allocations
+struct MemoryPool {
+    free_lists: [AtomicPtr<PoolNode>; POOL_SIZE_CLASSES],
+    initialized: AtomicBool,
+}
+
+impl MemoryPool {
+    const fn new() -> Self {
+        Self {
+            free_lists: [
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+            ],
+        }
+    }
+
+    /// Get size class index for a given size
+    #[inline]
+    fn size_class(size: usize) -> Option<usize> {
+        if size == 0 || size > SMALL_ALLOC_THRESHOLD {
+            return None;
+        }
+        // Size classes: 32, 64, 96, 128, 160, 192, 224, 256
+        Some(((size + 31) / 32).saturating_sub(1).min(POOL_SIZE_CLASSES - 1))
+    }
+
+    /// Get allocation size for a size class
+    #[inline]
+    fn class_size(class: usize) -> usize {
+        (class + 1) * 32
+    }
+
+    /// Try to allocate from pool
+    fn try_alloc(&self, size: usize) -> Option<NonNull<u8>> {
+        let class = Self::size_class(size)?;
+        let free_list = &self.free_lists[class];
+        
+        loop {
+            let head = free_list.load(Ordering::Acquire);
+            if head.is_null() {
+                POOL_STATS.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            
+            // SAFETY: head is non-null and was previously allocated by us
+            let next = unsafe { (*head).next.load(Ordering::Relaxed) };
+            
+            if free_list.compare_exchange_weak(
+                head,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ).is_ok() {
+                POOL_STATS.hits.fetch_add(1, Ordering::Relaxed);
+                return NonNull::new(head as *mut u8);
+            }
+        }
+    }
+
+    /// Return memory to pool
+    fn return_to_pool(&self, ptr: NonNull<u8>, size: usize) -> bool {
+        let Some(class) = Self::size_class(size) else {
+            return false;
+        };
+        
+        let node = ptr.as_ptr() as *mut PoolNode;
+        let free_list = &self.free_lists[class];
+        
+        loop {
+            let head = free_list.load(Ordering::Relaxed);
+            // SAFETY: node points to valid memory we own
+            unsafe { (*node).next.store(head, Ordering::Relaxed) };
+            
+            if free_list.compare_exchange_weak(
+                head,
+                node,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return true;
+            }
+        }
+    }
+}
+
+static MEMORY_POOL: MemoryPool = MemoryPool::new();
+
+/// Track allocation in global statistics
+#[inline]
+fn track_allocation(size: usize) {
+    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    let new_total = TOTAL_ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    
+    // Update peak if necessary
+    let mut peak = PEAK_ALLOCATED_BYTES.load(Ordering::Relaxed);
+    while new_total > peak {
+        match PEAK_ALLOCATED_BYTES.compare_exchange_weak(
+            peak,
+            new_total,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => peak = current,
+        }
+    }
+}
+
+/// Track deallocation in global statistics
+#[inline]
+fn track_deallocation(size: usize) {
+    ALLOCATION_COUNT.fetch_sub(1, Ordering::Relaxed);
+    TOTAL_ALLOCATED_BYTES.fetch_sub(size, Ordering::Relaxed);
+}
+
+/// RAII wrapper for raw memory allocations with automatic cleanup
+pub struct SafeBuffer<T> {
     ptr: NonNull<T>,
     len: usize,
     capacity: usize,
-    layout: Layout,
-    strategy: S,
+    from_pool: bool,
     _marker: PhantomData<T>,
 }
 
-impl<T> SafeBuffer<T, HeapStrategy> {
-    /// Create a new buffer with the specified capacity using default heap strategy
+impl<T> SafeBuffer<T> {
+    /// Create a new buffer with the specified capacity
     pub fn with_capacity(capacity: usize) -> Result<Self, MapperError> {
-        Self::with_capacity_and_strategy(capacity, HeapStrategy)
-    }
-    
-    /// Create a new zeroed buffer with the specified capacity
-    pub fn zeroed(capacity: usize) -> Result<SafeBuffer<T, ZeroedHeapStrategy>, MapperError> {
-        SafeBuffer::with_capacity_and_strategy(capacity, ZeroedHeapStrategy)
-    }
-}
-
-impl<T, S: AllocationStrategy> SafeBuffer<T, S> {
-    /// Create a new buffer with custom allocation strategy
-    pub fn with_capacity_and_strategy(capacity: usize, strategy: S) -> Result<Self, MapperError> {
         if capacity == 0 {
-            return Err(MapperError::InvalidParameter("Capacity must be greater than zero".into()));
+            return Err(MapperError::InvalidParameter("capacity cannot be zero".into()));
         }
-        
-        let layout = Layout::array::<T>(capacity)
-            .map_err(|_| MapperError::InvalidParameter("Layout calculation overflow".into()))?;
-        
-        let ptr = strategy.allocate(layout)?;
-        
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        TOTAL_ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        
+
+        let size = capacity.checked_mul(mem::size_of::<T>())
+            .ok_or_else(|| MapperError::InvalidParameter("allocation size overflow".into()))?;
+
+        let (ptr, from_pool) = if size <= SMALL_ALLOC_THRESHOLD && mem::align_of::<T>() <= 32 {
+            if let Some(p) = MEMORY_POOL.try_alloc(size) {
+                (p.cast(), true)
+            } else {
+                (Self::alloc_raw(size, mem::align_of::<T>())?, false)
+            }
+        } else {
+            (Self::alloc_raw(size, mem::align_of::<T>())?, false)
+        };
+
+        if !from_pool {
+            track_allocation(size);
+        }
+
         Ok(Self {
-            ptr: ptr.cast(),
+            ptr,
             len: 0,
             capacity,
-            layout,
-            strategy,
+            from_pool,
             _marker: PhantomData,
         })
     }
-    
-    /// Returns the number of elements in the buffer
+
+    /// Create a zeroed buffer with the specified capacity
+    pub fn zeroed(capacity: usize) -> Result<Self, MapperError> {
+        if capacity == 0 {
+            return Err(MapperError::InvalidParameter("capacity cannot be zero".into()));
+        }
+
+        let size = capacity.checked_mul(mem::size_of::<T>())
+            .ok_or_else(|| MapperError::InvalidParameter("allocation size overflow".into()))?;
+
+        let layout = Layout::from_size_align(size, mem::align_of::<T>())
+            .map_err(|_| MapperError::InvalidParameter("invalid layout".into()))?;
+
+        // SAFETY: layout is valid and non-zero
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr as *mut T)
+            .ok_or_else(|| MapperError::AllocationFailed(size))?;
+
+        track_allocation(size);
+
+        Ok(Self {
+            ptr,
+            len: 0,
+            capacity,
+            from_pool: false,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Allocate raw memory with specified size and alignment
+    fn alloc_raw(size: usize, align: usize) -> Result<NonNull<T>, MapperError> {
+        let layout = Layout::from_size_align(size, align)
+            .map_err(|_| MapperError::InvalidParameter("invalid layout".into()))?;
+
+        // SAFETY: layout is valid and non-zero
+        let ptr = unsafe { alloc(layout) };
+        NonNull::new(ptr as *mut T)
+            .ok_or_else(|| MapperError::AllocationFailed(size))
+    }
+
+    /// Get the current length
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
-    
-    /// Returns true if the buffer is empty
+
+    /// Check if buffer is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    
-    /// Returns the capacity of the buffer
+
+    /// Get the capacity
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-    
-    /// Returns a raw pointer to the buffer
+
+    /// Get raw pointer
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr()
     }
-    
-    /// Returns a mutable raw pointer to the buffer
+
+    /// Get mutable raw pointer
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr.as_ptr()
     }
-    
-    /// Push an element to the buffer
-    pub fn push(&mut self, value: T) -> Result<(), MapperError> {
-        if self.len >= self.capacity {
-            self.grow()?;
-        }
-        
-        unsafe {
-            std::ptr::write(self.ptr.as_ptr().add(self.len), value);
-        }
-        self.len += 1;
-        Ok(())
+
+    /// Set the length (unsafe - caller must ensure elements are initialized)
+    /// 
+    /// # Safety
+    /// Caller must ensure that `new_len` elements are properly initialized
+    #[inline]
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity);
+        self.len = new_len;
     }
-    
-    /// Pop an element from the buffer
-    pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
+
+    /// Resize the buffer, potentially reallocating
+    pub fn resize(&mut self, new_capacity: usize) -> Result<(), MapperError> {
+        if new_capacity == self.capacity {
+            return Ok(());
         }
-        
-        self.len -= 1;
-        unsafe { Some(std::ptr::read(self.ptr.as_ptr().add(self.len))) }
-    }
-    
-    /// Clear all elements from the buffer
-    pub fn clear(&mut self) {
-        while self.pop().is_some() {}
-    }
-    
-    /// Grow the buffer capacity
-    fn grow(&mut self) -> Result<(), MapperError> {
-        let new_capacity = self.capacity.checked_mul(2)
-            .ok_or_else(|| MapperError::InvalidParameter("Capacity overflow".into()))?;
-        
-        let new_layout = Layout::array::<T>(new_capacity)
-            .map_err(|_| MapperError::InvalidParameter("Layout calculation overflow".into()))?;
-        
-        let new_ptr = self.strategy.reallocate(
-            self.ptr.cast(),
-            self.layout,
-            new_layout.size(),
-        )?;
-        
-        TOTAL_ALLOCATED_BYTES.fetch_sub(self.layout.size(), Ordering::Relaxed);
-        TOTAL_ALLOCATED_BYTES.fetch_add(new_layout.size(), Ordering::Relaxed);
-        
-        self.ptr = new_ptr.cast();
+
+        let old_size = self.capacity * mem::size_of::<T>();
+        let new_size = new_capacity.checked_mul(mem::size_of::<T>())
+            .ok_or_else(|| MapperError::InvalidParameter("allocation size overflow".into()))?;
+
+        // If from pool, we need to allocate new memory and copy
+        if self.from_pool {
+            let new_ptr = Self::alloc_raw(new_size, mem::align_of::<T>())?;
+            
+            // SAFETY: both pointers are valid, non-overlapping
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.ptr.as_ptr(),
+                    new_ptr.as_ptr(),
+                    self.len.min(new_capacity),
+                );
+            }
+            
+            // Return old memory to pool
+            let pool_size = MemoryPool::size_class(old_size)
+                .map(MemoryPool::class_size)
+                .unwrap_or(old_size);
+            MEMORY_POOL.return_to_pool(self.ptr.cast(), pool_size);
+            
+            self.ptr = new_ptr;
+            self.from_pool = false;
+            track_allocation(new_size);
+        } else {
+            let old_layout = Layout::from_size_align(old_size, mem::align_of::<T>())
+                .map_err(|_| MapperError::InvalidParameter("invalid layout".into()))?;
+
+            // SAFETY: ptr was allocated with old_layout, new_size is valid
+            let new_ptr = unsafe {
+                realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_size)
+            };
+
+            self.ptr = NonNull::new(new_ptr as *mut T)
+                .ok_or_else(|| MapperError::AllocationFailed(new_size))?;
+
+            // Update tracking
+            if new_size > old_size {
+                track_allocation(new_size - old_size);
+            } else {
+                track_deallocation(old_size - new_size);
+            }
+        }
+
         self.capacity = new_capacity;
-        self.layout = new_layout;
-        
+        self.len = self.len.min(new_capacity);
         Ok(())
     }
-    
-    /// Get a slice view of the buffer contents
+
+    /// Get a slice of the initialized portion
+    #[inline]
     pub fn as_slice(&self) -> &[T] {
+        // SAFETY: ptr is valid and len elements are initialized
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
-    
-    /// Get a mutable slice view of the buffer contents
+
+    /// Get a mutable slice of the initialized portion
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: ptr is valid and len elements are initialized
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-impl<T, S: AllocationStrategy> Drop for SafeBuffer<T, S> {
+impl<T> Drop for SafeBuffer<T> {
     fn drop(&mut self) {
-        // Drop all elements
-        for i in 0..self.len {
-            unsafe {
-                std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
+        let size = self.capacity * mem::size_of::<T>();
+        
+        if self.from_pool {
+            let pool_size = MemoryPool::size_class(size)
+                .map(MemoryPool::class_size)
+                .unwrap_or(size);
+            MEMORY_POOL.return_to_pool(self.ptr.cast(), pool_size);
+        } else {
+            if let Ok(layout) = Layout::from_size_align(size, mem::align_of::<T>()) {
+                // SAFETY: ptr was allocated with this layout
+                unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
+                track_deallocation(size);
             }
         }
-        
-        // Deallocate memory
-        self.strategy.deallocate(self.ptr.cast(), self.layout);
-        
-        ALLOCATION_COUNT.fetch_sub(1, Ordering::Relaxed);
-        TOTAL_ALLOCATED_BYTES.fetch_sub(self.layout.size(), Ordering::Relaxed);
     }
 }
 
-impl<T, S: AllocationStrategy> Deref for SafeBuffer<T, S> {
+impl<T> Deref for SafeBuffer<T> {
     type Target = [T];
-    
+
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
-impl<T, S: AllocationStrategy> DerefMut for SafeBuffer<T, S> {
+impl<T> DerefMut for SafeBuffer<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
 
-unsafe impl<T: Send, S: AllocationStrategy + Send> Send for SafeBuffer<T, S> {}
-unsafe impl<T: Sync, S: AllocationStrategy + Sync> Sync for SafeBuffer<T, S> {}
+impl<T: fmt::Debug> fmt::Debug for SafeBuffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SafeBuffer")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .field("from_pool", &self.from_pool)
+            .field("data", &self.as_slice())
+            .finish()
+    }
+}
 
-/// Memory region descriptor for virtual memory operations
+// SAFETY: SafeBuffer owns its data and T is Send
+unsafe impl<T: Send> Send for SafeBuffer<T> {}
+// SAFETY: SafeBuffer provides &T access and T is Sync
+unsafe impl<T: Sync> Sync for SafeBuffer<T> {}
+
+/// Cache-aligned allocation wrapper for hot data structures
+#[repr(C, align(64))]
+pub struct CacheAligned<T> {
+    value: T,
+}
+
+impl<T> CacheAligned<T> {
+    /// Create a new cache-aligned value
+    #[inline]
+    pub const fn new(value: T) -> Self {
+        Self { value }
+    }
+
+    /// Get reference to inner value
+    #[inline]
+    pub fn get(&self) -> &T {
+        &self.value
+    }
+
+    /// Get mutable reference to inner value
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    /// Consume and return inner value
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<T> Deref for CacheAligned<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for CacheAligned<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T: Default> Default for CacheAligned<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for CacheAligned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+/// Batch allocator for bulk memory operations
+pub struct BatchAllocator {
+    chunk_size: usize,
+    chunks: Vec<NonNull<u8>>,
+    current_offset: usize,
+    total_allocated: usize,
+}
+
+impl BatchAllocator {
+    /// Create a new batch allocator with specified chunk size
+    pub fn new(chunk_size: usize) -> Self {
+        Self {
+            chunk_size: chunk_size.max(4096),
+            chunks: Vec::new(),
+            current_offset: 0,
+            total_allocated: 0,
+        }
+    }
+
+    /// Allocate memory from the batch allocator
+    pub fn alloc<T>(&mut self) -> Result<NonNull<T>, MapperError> {
+        self.alloc_aligned(mem::size_of::<T>(), mem::align_of::<T>())
+            .map(|p| p.cast())
+    }
+
+    /// Allocate memory with specific alignment
+    pub fn alloc_aligned(&mut self, size: usize, align: usize) -> Result<NonNull<u8>, MapperError> {
+        if size == 0 {
+            return Err(MapperError::InvalidParameter("size cannot be zero".into()));
+        }
+
+        // Align current offset
+        let aligned_offset = (self.current_offset + align - 1) & !(align - 1);
+        
+        // Check if we have space in current chunk
+        if self.chunks.is_empty() || aligned_offset + size > self.chunk_size {
+            self.allocate_chunk()?;
+            self.current_offset = 0;
+        }
+
+        let aligned_offset = (self.current_offset + align - 1) & !(align - 1);
+        let chunk = *self.chunks.last().unwrap();
+        
+        // SAFETY: offset is within bounds of chunk
+        let ptr = unsafe { chunk.as_ptr().add(aligned_offset) };
+        self.current_offset = aligned_offset + size;
+        
+        NonNull::new(ptr).ok_or_else(|| MapperError::AllocationFailed(size))
+    }
+
+    /// Allocate a new chunk
+    fn allocate_chunk(&mut self) -> Result<(), MapperError> {
+        let layout = Layout::from_size_align(self.chunk_size, CACHE_LINE_SIZE)
+            .map_err(|_| MapperError::InvalidParameter("invalid layout".into()))?;
+
+        // SAFETY: layout is valid
+        let ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(ptr)
+            .ok_or_else(|| MapperError::AllocationFailed(self.chunk_size))?;
+
+        self.chunks.push(ptr);
+        self.total_allocated += self.chunk_size;
+        track_allocation(self.chunk_size);
+        
+        Ok(())
+    }
+
+    /// Get total bytes allocated
+    #[inline]
+    pub fn total_allocated(&self) -> usize {
+        self.total_allocated
+    }
+
+    /// Reset allocator, keeping allocated chunks for reuse
+    pub fn reset(&mut self) {
+        self.current_offset = 0;
+        // Keep only first chunk if we have multiple
+        if self.chunks.len() > 1 {
+            let layout = Layout::from_size_align(self.chunk_size, CACHE_LINE_SIZE).unwrap();
+            for chunk in self.chunks.drain(1..) {
+                // SAFETY: chunk was allocated with this layout
+                unsafe { dealloc(chunk.as_ptr(), layout) };
+                track_deallocation(self.chunk_size);
+            }
+            self.total_allocated = self.chunk_size;
+        }
+    }
+}
+
+impl Drop for BatchAllocator {
+    fn drop(&mut self) {
+        if let Ok(layout) = Layout::from_size_align(self.chunk_size, CACHE_LINE_SIZE) {
+            for chunk in &self.chunks {
+                // SAFETY: chunk was allocated with this layout
+                unsafe { dealloc(chunk.as_ptr(), layout) };
+                track_deallocation(self.chunk_size);
+            }
+        }
+    }
+}
+
+/// Memory region descriptor for process memory operations
 #[derive(Debug, Clone)]
 pub struct MemoryRegion {
     pub base_address: usize,
@@ -382,7 +684,7 @@ pub struct MemoryRegion {
     pub region_type: MemoryType,
 }
 
-/// Memory state enumeration
+/// Memory state flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryState {
     Commit,
@@ -390,7 +692,7 @@ pub enum MemoryState {
     Free,
 }
 
-/// Memory type enumeration
+/// Memory type flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
     Private,
@@ -415,13 +717,13 @@ impl MemoryRegion {
             region_type,
         }
     }
-    
+
     /// Check if an address falls within this region
     #[inline]
     pub fn contains(&self, address: usize) -> bool {
         address >= self.base_address && address < self.base_address + self.size
     }
-    
+
     /// Get the end address of this region
     #[inline]
     pub fn end_address(&self) -> usize {
@@ -429,348 +731,154 @@ impl MemoryRegion {
     }
 }
 
-/// Observer trait for memory events
-pub trait MemoryObserver: Send + Sync {
-    /// Called when memory is allocated
-    fn on_allocate(&self, address: usize, size: usize, protection: MemoryProtection);
-    
-    /// Called when memory is freed
-    fn on_free(&self, address: usize, size: usize);
-    
-    /// Called when memory protection changes
-    fn on_protect(&self, address: usize, size: usize, old_protection: MemoryProtection, new_protection: MemoryProtection);
-}
-
-/// Memory manager with observer support
-pub struct MemoryManager {
-    regions: Vec<MemoryRegion>,
-    observers: Vec<Box<dyn MemoryObserver>>,
-}
-
-impl MemoryManager {
-    /// Create a new memory manager
-    pub fn new() -> Self {
-        Self {
-            regions: Vec::new(),
-            observers: Vec::new(),
-        }
-    }
-    
-    /// Register an observer for memory events
-    pub fn register_observer(&mut self, observer: Box<dyn MemoryObserver>) {
-        self.observers.push(observer);
-    }
-    
-    /// Track a memory allocation
-    pub fn track_allocation(&mut self, region: MemoryRegion) {
-        for observer in &self.observers {
-            observer.on_allocate(region.base_address, region.size, region.protection);
-        }
-        self.regions.push(region);
-    }
-    
-    /// Track memory being freed
-    pub fn track_free(&mut self, base_address: usize) -> Option<MemoryRegion> {
-        if let Some(pos) = self.regions.iter().position(|r| r.base_address == base_address) {
-            let region = self.regions.remove(pos);
-            for observer in &self.observers {
-                observer.on_free(region.base_address, region.size);
-            }
-            Some(region)
-        } else {
-            None
-        }
-    }
-    
-    /// Find a region containing the given address
-    pub fn find_region(&self, address: usize) -> Option<&MemoryRegion> {
-        self.regions.iter().find(|r| r.contains(address))
-    }
-    
-    /// Get all tracked regions
-    pub fn regions(&self) -> &[MemoryRegion] {
-        &self.regions
-    }
-    
-    /// Calculate total committed memory
-    pub fn total_committed(&self) -> usize {
-        self.regions
-            .iter()
-            .filter(|r| r.state == MemoryState::Commit)
-            .map(|r| r.size)
-            .sum()
-    }
-}
-
-impl Default for MemoryManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Safe wrapper for reading memory from a process
-pub struct ProcessMemoryReader {
-    process_id: u32,
-    base_address: usize,
-}
-
-impl ProcessMemoryReader {
-    /// Create a new process memory reader
-    pub fn new(process_id: u32, base_address: usize) -> Self {
-        Self {
-            process_id,
-            base_address,
-        }
-    }
-    
-    /// Read a value of type T from the specified offset
-    /// 
-    /// # Safety
-    /// The caller must ensure the memory at the offset is valid and properly aligned for type T
-    pub unsafe fn read_at<T: Copy>(&self, offset: usize) -> Result<T, MapperError> {
-        let address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        // TODO: Implement actual process memory reading via system calls
-        // This is a placeholder that would need platform-specific implementation
-        Err(MapperError::NotImplemented("Process memory reading requires platform-specific implementation".into()))
-    }
-    
-    /// Read bytes into a buffer from the specified offset
-    pub fn read_bytes(&self, offset: usize, buffer: &mut [u8]) -> Result<usize, MapperError> {
-        let _address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        // TODO: Implement actual process memory reading
-        Err(MapperError::NotImplemented("Process memory reading requires platform-specific implementation".into()))
-    }
-    
-    /// Get the process ID
-    #[inline]
-    pub fn process_id(&self) -> u32 {
-        self.process_id
-    }
-    
-    /// Get the base address
-    #[inline]
-    pub fn base_address(&self) -> usize {
-        self.base_address
-    }
-}
-
-/// Safe wrapper for writing memory to a process
-pub struct ProcessMemoryWriter {
-    process_id: u32,
-    base_address: usize,
-}
-
-impl ProcessMemoryWriter {
-    /// Create a new process memory writer
-    pub fn new(process_id: u32, base_address: usize) -> Self {
-        Self {
-            process_id,
-            base_address,
-        }
-    }
-    
-    /// Write a value of type T at the specified offset
-    /// 
-    /// # Safety
-    /// The caller must ensure the memory at the offset is valid, writable, and properly aligned for type T
-    pub unsafe fn write_at<T: Copy>(&self, offset: usize, value: &T) -> Result<(), MapperError> {
-        let _address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        // TODO: Implement actual process memory writing via system calls
-        Err(MapperError::NotImplemented("Process memory writing requires platform-specific implementation".into()))
-    }
-    
-    /// Write bytes from a buffer at the specified offset
-    pub fn write_bytes(&self, offset: usize, buffer: &[u8]) -> Result<usize, MapperError> {
-        let _address = self.base_address.checked_add(offset)
-            .ok_or_else(|| MapperError::InvalidParameter("Address overflow".into()))?;
-        
-        // TODO: Implement actual process memory writing
-        Err(MapperError::NotImplemented("Process memory writing requires platform-specific implementation".into()))
-    }
-}
-
-/// Memory pattern scanner for finding byte sequences
-pub struct PatternScanner<'a> {
+/// Safe wrapper for reading memory with bounds checking
+pub struct MemoryReader<'a> {
     data: &'a [u8],
+    position: usize,
 }
 
-impl<'a> PatternScanner<'a> {
-    /// Create a new pattern scanner for the given data
+impl<'a> MemoryReader<'a> {
+    /// Create a new memory reader
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data }
+        Self { data, position: 0 }
     }
-    
-    /// Find the first occurrence of a pattern with optional wildcards
-    /// Wildcards are represented as None in the pattern
-    pub fn find_pattern(&self, pattern: &[Option<u8>]) -> Option<usize> {
-        if pattern.is_empty() || pattern.len() > self.data.len() {
-            return None;
-        }
-        
-        'outer: for i in 0..=(self.data.len() - pattern.len()) {
-            for (j, &pat_byte) in pattern.iter().enumerate() {
-                if let Some(expected) = pat_byte {
-                    if self.data[i + j] != expected {
-                        continue 'outer;
-                    }
-                }
-            }
-            return Some(i);
-        }
-        
-        None
+
+    /// Get current position
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.position
     }
-    
-    /// Find all occurrences of a pattern
-    pub fn find_all_patterns(&self, pattern: &[Option<u8>]) -> Vec<usize> {
-        let mut results = Vec::new();
-        
-        if pattern.is_empty() || pattern.len() > self.data.len() {
-            return results;
-        }
-        
-        'outer: for i in 0..=(self.data.len() - pattern.len()) {
-            for (j, &pat_byte) in pattern.iter().enumerate() {
-                if let Some(expected) = pat_byte {
-                    if self.data[i + j] != expected {
-                        continue 'outer;
-                    }
-                }
-            }
-            results.push(i);
-        }
-        
-        results
+
+    /// Get remaining bytes
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.position)
     }
-    
-    /// Parse a pattern string like "48 8B ?? 90" into a pattern vector
-    pub fn parse_pattern_string(pattern_str: &str) -> Result<Vec<Option<u8>>, MapperError> {
-        let mut pattern = Vec::new();
-        
-        for part in pattern_str.split_whitespace() {
-            if part == "??" || part == "?" {
-                pattern.push(None);
-            } else {
-                let byte = u8::from_str_radix(part, 16)
-                    .map_err(|_| MapperError::InvalidParameter(format!("Invalid hex byte: {}", part)))?;
-                pattern.push(Some(byte));
-            }
+
+    /// Seek to a position
+    pub fn seek(&mut self, position: usize) -> Result<(), MapperError> {
+        if position > self.data.len() {
+            return Err(MapperError::InvalidParameter("seek position out of bounds".into()));
         }
-        
-        Ok(pattern)
+        self.position = position;
+        Ok(())
+    }
+
+    /// Read a value of type T
+    pub fn read<T: Copy>(&mut self) -> Result<T, MapperError> {
+        let size = mem::size_of::<T>();
+        if self.position + size > self.data.len() {
+            return Err(MapperError::BufferTooSmall {
+                required: size,
+                available: self.remaining(),
+            });
+        }
+
+        // SAFETY: we've verified bounds and alignment requirements
+        let value = unsafe {
+            let ptr = self.data.as_ptr().add(self.position) as *const T;
+            ptr.read_unaligned()
+        };
+
+        self.position += size;
+        Ok(value)
+    }
+
+    /// Read a slice of bytes
+    pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], MapperError> {
+        if self.position + len > self.data.len() {
+            return Err(MapperError::BufferTooSmall {
+                required: len,
+                available: self.remaining(),
+            });
+        }
+
+        let slice = &self.data[self.position..self.position + len];
+        self.position += len;
+        Ok(slice)
+    }
+
+    /// Peek at a value without advancing position
+    pub fn peek<T: Copy>(&self) -> Result<T, MapperError> {
+        let size = mem::size_of::<T>();
+        if self.position + size > self.data.len() {
+            return Err(MapperError::BufferTooSmall {
+                required: size,
+                available: self.remaining(),
+            });
+        }
+
+        // SAFETY: we've verified bounds
+        let value = unsafe {
+            let ptr = self.data.as_ptr().add(self.position) as *const T;
+            ptr.read_unaligned()
+        };
+
+        Ok(value)
     }
 }
 
 /// Get current allocation statistics
-pub fn allocation_stats() -> (usize, usize) {
-    (
-        ALLOCATION_COUNT.load(Ordering::Relaxed),
-        TOTAL_ALLOCATED_BYTES.load(Ordering::Relaxed),
-    )
+pub fn get_allocation_stats() -> AllocationStats {
+    AllocationStats::capture()
 }
 
 /// Reset allocation statistics (for testing)
 pub fn reset_allocation_stats() {
     ALLOCATION_COUNT.store(0, Ordering::Relaxed);
     TOTAL_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-}
-
-impl<T: fmt::Debug, S: AllocationStrategy> fmt::Debug for SafeBuffer<T, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SafeBuffer")
-            .field("len", &self.len)
-            .field("capacity", &self.capacity)
-            .field("contents", &self.as_slice())
-            .finish()
-    }
+    PEAK_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    POOL_STATS.hits.store(0, Ordering::Relaxed);
+    POOL_STATS.misses.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_safe_buffer_basic_operations() {
-        let mut buffer: SafeBuffer<i32> = SafeBuffer::with_capacity(4).unwrap();
-        
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.capacity(), 4);
-        
-        buffer.push(1).unwrap();
-        buffer.push(2).unwrap();
-        buffer.push(3).unwrap();
-        
-        assert_eq!(buffer.len(), 3);
-        assert_eq!(buffer.as_slice(), &[1, 2, 3]);
-        
-        assert_eq!(buffer.pop(), Some(3));
-        assert_eq!(buffer.len(), 2);
+    fn test_safe_buffer_creation() {
+        let buffer: SafeBuffer<u32> = SafeBuffer::with_capacity(100).unwrap();
+        assert_eq!(buffer.capacity(), 100);
+        assert_eq!(buffer.len(), 0);
     }
-    
+
     #[test]
-    fn test_safe_buffer_growth() {
-        let mut buffer: SafeBuffer<i32> = SafeBuffer::with_capacity(2).unwrap();
-        
-        for i in 0..10 {
-            buffer.push(i).unwrap();
+    fn test_safe_buffer_zeroed() {
+        let buffer: SafeBuffer<u8> = SafeBuffer::zeroed(64).unwrap();
+        assert_eq!(buffer.capacity(), 64);
+        // Verify memory is zeroed by checking raw bytes
+        let ptr = buffer.as_ptr();
+        for i in 0..64 {
+            unsafe {
+                assert_eq!(*ptr.add(i), 0);
+            }
         }
-        
-        assert_eq!(buffer.len(), 10);
-        assert!(buffer.capacity() >= 10);
     }
-    
+
     #[test]
     fn test_memory_protection_flags() {
         assert!(MemoryProtection::ReadWrite.can_read());
         assert!(MemoryProtection::ReadWrite.can_write());
         assert!(!MemoryProtection::ReadWrite.can_execute());
         
+        assert!(MemoryProtection::ExecuteReadWrite.can_execute());
         assert!(MemoryProtection::ExecuteReadWrite.can_read());
         assert!(MemoryProtection::ExecuteReadWrite.can_write());
-        assert!(MemoryProtection::ExecuteReadWrite.can_execute());
-        
-        assert!(!MemoryProtection::NoAccess.can_read());
-        assert!(!MemoryProtection::NoAccess.can_write());
-        assert!(!MemoryProtection::NoAccess.can_execute());
     }
-    
+
     #[test]
-    fn test_memory_region() {
-        let region = MemoryRegion::new(
-            0x1000,
-            0x1000,
-            MemoryProtection::ReadWrite,
-            MemoryState::Commit,
-            MemoryType::Private,
-        );
+    fn test_cache_aligned() {
+        let aligned = CacheAligned::new(42u64);
+        assert_eq!(*aligned, 42);
         
-        assert!(region.contains(0x1000));
-        assert!(region.contains(0x1500));
-        assert!(!region.contains(0x2000));
-        assert_eq!(region.end_address(), 0x2000);
+        let ptr = &aligned as *const _ as usize;
+        assert_eq!(ptr % CACHE_LINE_SIZE, 0);
     }
-    
+
     #[test]
-    fn test_pattern_scanner() {
-        let data = [0x48, 0x8B, 0x05, 0x90, 0x90, 0x48, 0x8B, 0x0D];
-        let scanner = PatternScanner::new(&data);
+    fn test_batch_allocator() {
+        let mut allocator = BatchAllocator::new(4096);
         
-        let pattern = vec![Some(0x48), Some(0x8B), None];
-        assert_eq!(scanner.find_pattern(&pattern), Some(0));
-        
-        let all_matches = scanner.find_all_patterns(&pattern);
-        assert_eq!(all_matches, vec![0, 5]);
-    }
-    
-    #[test]
-    fn test_pattern_string_parsing() {
-        let pattern = PatternScanner::parse_pattern_string("48 8B ?? 90").unwrap();
-        assert_eq!(pattern, vec![Some(0x48), Some(0x8B), None, Some(0x90)]);
-    }
-}
+        let ptr1: NonNull<u32> = allocator.alloc().unwrap();
+        let ptr2: NonNull<u64> = allocator.alloc().unwrap();
